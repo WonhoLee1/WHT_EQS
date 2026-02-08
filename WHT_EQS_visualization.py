@@ -284,9 +284,8 @@ def stage2_visualize_ground_truth(fem, targets, params):
             print("⚠ Invalid input. Please enter a number.")
             continue
         
-        # Extract displacement field (6 DOF per node: u, v, w, θx, θy, θz)
-        u = np.array(tgt['u_static'])
-        w = u[2::6]  # W-displacement (vertical, every 6th element starting from index 2)
+        # Extract displacement field (Already pre-extracted as w field in main script)
+        w = np.array(tgt['u_static'])
         
         # Create deformed mesh with magnification for visualization
         scale = 30.0  # Deformation magnification factor (adjust as needed)

@@ -106,7 +106,7 @@ class EquivalentSheetModel:
             self.targets.append({
                 'case_name': case.name,
                 'weight': case.weight,
-                'u_static': u[0::3],  # W displacement only
+                'u_static': u[2::6],  # W displacement only (3rd DOF in 6-DOF system)
                 'max_surface_stress': fem_high.compute_max_surface_stress(u, params_high),
                 'max_surface_strain': fem_high.compute_max_surface_strain(u, params_high),
                 'params': params_high
