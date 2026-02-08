@@ -212,29 +212,86 @@ class EquivalentSheetModel:
                                      self.target_params_high)
 
 # ==============================================================================
-# MAIN EXECUTION
+# MAIN EXECUTION: COMPREHENSIVE CONFIGURATION TEMPLATE
 # ==============================================================================
 if __name__ == '__main__':
+    # 1. Initialize Model Manager (Low-res mesh for optimization)
     model = EquivalentSheetModel(Lx, Ly, Nx_low, Ny_low)
     
-    # Load Cases
-    model.add_case(TwistCase("twist_x", axis='x', value=1.5))
-    model.add_case(PureBendingCase("bend_y", axis='y', value=3.0))
+    # 2. Define Comprehensive Load Cases for Optimization
+    # Supports multiple cases: Twist, Pure Bending, and Corner Lift
+    model.add_case(TwistCase("twist_x", axis='x', value=1.5, mode='angle', weight=1.0))
+    model.add_case(TwistCase("twist_y", axis='y', value=1.5, mode='angle', weight=0.5))
+    model.add_case(PureBendingCase("bend_y", axis='y', value=3.0, mode='angle', weight=1.0))
+    model.add_case(CornerLiftCase("lift_br", corner='br', value=5.0, mode='disp', weight=0.8))
     
+    # 3. Ground Truth Generation Configuration (target_config)
+    # This defines the "Physical Reality" we want our optimization to match.
     target_config = {
-        'pattern': 'ABC',
-        'bead_t': {'A': 2.0, 'B': 2.5, 'C': 1.5},
-        'pattern_pz': 'TNY',
-        'bead_pz': {'T': 2.0, 'N': 1.0, 'Y': -2.0}
+        # --- Thickness (Bead) Patterns ---
+        'pattern': 'ABC',           # Alphanumeric bead pattern string
+        'base_t': 1.0,              # Base sheet thickness (mm)
+        'bead_t': {                 # Per-character bead thickness (mm)
+            'A': 2.0, 
+            'B': 2.5, 
+            'C': 1.5,
+            'default': 2.0          # Fallback if character not in dict
+        },
+        
+        # --- Topography (Z-Shape) Patterns ---
+        'pattern_pz': 'TNY',        # Topography pattern string (embossed features)
+        'bead_pz': {                # Per-character Z-height (mm)
+            'T': 2.0,               # Raised +2mm
+            'N': 1.0,               # Raised +1mm
+            'Y': -2.0               # Recessed -2mm
+        },
+        
+        # --- Base Material Properties ---
+        'base_rho': 7.85e-9,        # Base Density (tonne/mm³) - e.g., steel
+        'base_E': 210000.0,         # Base Young's Modulus (MPa) - e.g., 210 GPa
     }
     
-    model.generate_targets(target_config=target_config)
+    # Generate ground truth responses (Includes interactive visualization stages)
+    model.generate_targets(
+        resolution_high=(50, 20),   # Resolution for high-fidelity "truth" mesh
+        num_modes_save=5,           # Number of eigenmodes to calculate and match
+        target_config=target_config # The configuration defined above
+    )
     
+    # 4. Optimization Strategy Configuration (opt_config)
+    # Define search space and initial guesses for equivalent parameters.
     opt_config = {
-        't': {'init': 1.2, 'min': 0.5, 'max': 5.0},
-        'rho': {'init': 7.5e-9, 'min': 5e-9, 'max': 1e-8},
-        'E': {'init': 200000.0, 'min': 100000.0, 'max': 300000.0}
+        't': {                      # Thickness Search Space
+            'init': 1.2,            # Initial starting guess (mm)
+            'min': 0.5,             # Lower bound for optimization
+            'max': 5.0              # Upper bound for optimization
+        },
+        'rho': {                    # Density Search Space
+            'init': 7.5e-9,         # Initial density guess (tonne/mm³)
+            'min': 5.0e-9, 
+            'max': 1.0e-8
+        },
+        'E': {                      # Stiffness (E) Search Space
+            'init': 200000.0,       # Initial Young's Modulus guess (MPa)
+            'min': 50000.0, 
+            'max': 300000.0
+        }
     }
     
-    model.optimize(opt_config, {'static': 1.0, 'freq': 0.1}, max_iterations=50)
+    # 5. Run Optimization Loop
+    # Fine-tune weights between matching static stiffness and dynamic frequencies.
+    loss_weights = {
+        'static': 1.0,              # Importance of matching displacement fields
+        'freq': 0.2,                # Importance of matching natural frequencies
+        'mass': 0.05                # (Future) Penalty for mass deviation
+    }
+    
+    model.optimize(
+        opt_config=opt_config, 
+        loss_weights=loss_weights, 
+        max_iterations=100          # Number of gradient descent steps (Adam)
+    )
+    
+    # 6. Final Comparative Verification
+    # Launches 3D Side-by-Side comparison of Target vs Optimized fields.
     model.verify()
