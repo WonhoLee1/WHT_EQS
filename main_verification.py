@@ -133,75 +133,129 @@ class EquivalentSheetModel:
         # [STAGE 2] Results Visualization
         stage2_visualize_ground_truth(fem_high, self.targets, params_high)
 
-    def optimize(self, opt_config, loss_weights, max_iterations=200):
-        print(f"\nStarting Optimization (Max Iters: {max_iterations})...")
+    def optimize(self, opt_config, loss_weights, max_iterations=200, **kwargs):
+        print(f"\nStarting Advanced Optimization (Max Iters: {max_iterations})...")
         Nx_l, Ny_l = self.fem.nx, self.fem.ny
-        xl = np.linspace(0, Lx, Nx_l+1)
-        yl = np.linspace(0, Ly, Ny_l+1)
-        Xl, Yl = np.meshgrid(xl, yl, indexing='ij')
-        pts_l = np.column_stack([Xl.flatten(), Yl.flatten()])
+        pts_l = self.fem.node_coords
         
-        # Interpolate targets to low-res
-        Nx_h, Ny_h = self.resolution_high
-        xh = np.linspace(0, Lx, Nx_h+1)
-        yh = np.linspace(0, Ly, Ny_h+1)
-        Xh, Yh = np.meshgrid(xh, yh, indexing='ij')
-        pts_h = np.column_stack([Xh.flatten(), Yh.flatten()])
-        
+        # 1. Target Data Interpolation to Low-Res Mesh
         self.targets_low = []
+        Nx_h, Ny_h = self.resolution_high
+        xh, yh = jnp.linspace(0, self.fem.Lx, Nx_h+1), jnp.linspace(0, self.fem.Ly, Ny_h+1)
+        Xh, Yh = jnp.meshgrid(xh, yh, indexing='ij')
+        pts_h = jnp.stack([Xh.flatten(), Yh.flatten()], axis=1)
+        
         for tgt in self.targets:
+            # Interpolate all metrics needed for loss
             u_l = griddata(pts_h, tgt['u_static'], pts_l, method='cubic')
+            stress_l = griddata(pts_h, tgt['max_surface_stress'], pts_l, method='cubic')
+            strain_l = griddata(pts_h, tgt['max_surface_strain'], pts_l, method='cubic')
+            
             self.targets_low.append({
-                'name': tgt['case_name'],
                 'u_static': jnp.array(u_l),
+                'max_stress': jnp.array(stress_l),
+                'max_strain': jnp.array(strain_l),
                 'weight': tgt['weight']
             })
             
-        # Target Eigenmodes interpolation
+        # Modal Targets
         t_vals = self.target_eigen['vals']
-        t_modes_l = []
-        for i in range(len(t_vals)):
-            m = griddata(pts_h, self.target_eigen['modes'][:, i], pts_l, method='cubic')
-            t_modes_l.append(m)
+        t_modes_l = [griddata(pts_h, self.target_eigen['modes'][:, i], pts_l, method='cubic') 
+                     for i in range(len(t_vals))]
         t_modes_l = jnp.stack(t_modes_l, axis=1)
 
-        # Optimization Setup
+        # 2. Optimization Parameters Setup
         params = {
             't': jnp.full((Nx_l+1, Ny_l+1), opt_config['t'].get('init', 1.0)),
             'rho': jnp.full((Nx_l+1, Ny_l+1), opt_config['rho'].get('init', 7.5e-9)),
             'E': jnp.full((Nx_l+1, Ny_l+1), opt_config['E'].get('init', 200000.0))
         }
         
-        optimizer = optax.adam(learning_rate=0.01)
+        optimizer = optax.adam(learning_rate=kwargs.get('learning_rate', 0.01))
         opt_state = optimizer.init(params)
 
         @jax.jit
         def loss_fn(p):
             K, M = self.fem.assemble(p)
-            l_static = 0.0
+            loss = 0.0
+            
+            # --- Static Component Loss ---
             for i, case in enumerate(self.cases):
                 fd, fv, F = case.get_bcs(self.fem)
                 free = jnp.setdiff1d(jnp.arange(self.fem.total_dof), fd)
                 u = self.fem.solve_static_partitioned(K, F, free, fd, fv)
-                # Compare W displacement (2nd index in 6-DOF, so u[2::6])
-                l_static += jnp.mean((u[2::6] - self.targets_low[i]['u_static'])**2) * case.weight
-            
-            vals, vecs = self.fem.solve_eigen(K, M, num_modes=len(t_vals)+10)
-            l_freq = jnp.mean((vals[6:6+len(t_vals)] - t_vals)**2)
-            
-            return l_static * loss_weights['static'] + l_freq * loss_weights['freq']
+                w = u[2::6] # W-displacement
+                
+                # Displacement Loss
+                loss += loss_weights.get('static', 0.0) * jnp.mean((w - self.targets_low[i]['u_static'])**2) * case.weight
+                
+                # Stress/Strain Loss (High-order metrics)
+                if loss_weights.get('surface_stress', 0.0) > 0:
+                    curr_stress = self.fem.compute_max_surface_stress(u, p)
+                    loss += loss_weights['surface_stress'] * jnp.mean((curr_stress - self.targets_low[i]['max_stress'])**2)
+                if loss_weights.get('surface_strain', 0.0) > 0:
+                    curr_strain = self.fem.compute_max_surface_strain(u, p)
+                    loss += loss_weights['surface_strain'] * jnp.mean((curr_strain - self.targets_low[i]['max_strain'])**2)
 
+            # --- Modal Component Loss ---
+            if loss_weights.get('freq', 0.0) > 0 or loss_weights.get('mode', 0.0) > 0:
+                vals, vecs = self.fem.solve_eigen(K, M, num_modes=len(t_vals)+10)
+                # Freq matching (Skip 6 RB modes)
+                loss += loss_weights.get('freq', 0.0) * jnp.mean((vals[6:6+len(t_vals)] - t_vals)**2)
+                
+                # Mode Shape matching (MAC - Modal Assurance Criterion)
+                if loss_weights.get('mode', 0.0) > 0:
+                    modes_w = vecs[2::6, 6:6+len(t_vals)] # W-component
+                    for j in range(len(t_vals)):
+                        # Simple MAC-based loss: 1 - Correlation^2
+                        num = jnp.sum(modes_w[:, j] * t_modes_l[:, j])**2
+                        den = jnp.sum(modes_w[:, j]**2) * jnp.sum(t_modes_l[:, j]**2)
+                        loss += loss_weights['mode'] * (1.0 - num/den)
+
+            # --- Constraints & Regularization ---
+            # Total Mass Constraint
+            if loss_weights.get('mass', 0.0) > 0:
+                dx, dy = self.fem.Lx/Nx_l, self.fem.Ly/Ny_l
+                curr_mass = jnp.sum(p['t'] * p['rho']) * dx * dy # Simple approx
+                loss += loss_weights['mass'] * ((curr_mass - self.target_mass)/self.target_mass)**2
+
+            # Smoothness (Total Variation Penalty)
+            if loss_weights.get('smoothness', 0.0) > 0:
+                diff_x = jnp.diff(p['t'], axis=0)**2
+                diff_y = jnp.diff(p['t'], axis=1)**2
+                loss += loss_weights['smoothness'] * (jnp.mean(diff_x) + jnp.mean(diff_y))
+
+            return loss
+
+        # 3. Optimization Loop with Early Stopping
+        patience = kwargs.get('patience', 20)
+        best_loss = float('inf')
+        wait = 0
+        
         for i in range(max_iterations):
             val, grads = jax.value_and_grad(loss_fn)(params)
             updates, opt_state = optimizer.update(grads, opt_state)
             params = optax.apply_updates(params, updates)
-            # Clip
+            
+            # Parameter Clipping (Safety)
             for k in params:
                 params[k] = jnp.clip(params[k], opt_config[k]['min'], opt_config[k]['max'])
-            if i % 20 == 0: print(f"Iter {i}: Loss = {val:.6e}")
+            
+            if i % 10 == 0:
+                print(f"Iter {i:3d} | Total Loss: {val:.6e}")
 
-        self.optimized_params = params
-        return params
+            # Early Stopping Check
+            if val < best_loss - 1e-8:
+                best_loss = val
+                wait = 0
+                self.optimized_params = params
+            else:
+                wait += 1
+                if wait >= patience:
+                    print(f"✔ Convergence reached. Early stopping at iteration {i}.")
+                    break
+
+        return self.optimized_params
 
     def verify(self):
         print("\nFinal Verification...")
@@ -279,24 +333,24 @@ if __name__ == '__main__':
         }
     }
     
-    # 5. Run Optimization Loop (loss_weights detailed configuration)
-    # Fine-tune the balance between matching physical behavior and meeting constraints.
+    # 5. Run Optimization Loop (Advanced Configuration)
+    # loss_weights now supports: static, freq, mode, surface_stress, surface_strain, mass, smoothness
     loss_weights = {
-        # --- Physical Matching Weights ---
-        'static': 1.0,      # Error in displacement fields (W-displacement) for all load cases.
-        'freq': 0.2,        # Error in natural frequencies (eigenvalues). Matches target dynamics.
-        
-        # --- Constraint & Regularization Weights ---
-        'mass': 0.1,        # Penalty for deviation from target total mass. Ensures weight parity.
-        'smoothness': 0.01, # Total Variation (TV) penalty to prevent "checkerboard" patterns
-                            # and ensure physically manufacturable (smooth) parameter fields.
-        'regularization': 0.001 # L2 penalty on parameter magnitude (stability aid).
+        'static': 1.0,           # Match static displacement fields
+        'freq': 0.5,             # Match natural frequencies
+        'mode': 0.5,             # Match mode shapes (MAC)
+        'surface_stress': 0.5,   # Match max surface stress distribution
+        'surface_strain': 0.5,   # Match max surface strain distribution
+        'mass': 0.2,             # Match total model mass
+        'smoothness': 0.05       # Ensure manufacturable (smooth) thickness fields
     }
     
     model.optimize(
         opt_config=opt_config, 
         loss_weights=loss_weights, 
-        max_iterations=100  # Number of gradient descent steps (Adam)
+        max_iterations=300,      # Increased for better convergence
+        learning_rate=0.01,      # Optimizer step size
+        patience=30              # Early stopping patience (iters without progress)
     )
     
     # 6. Final Comparative Verification
