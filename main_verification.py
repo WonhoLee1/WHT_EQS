@@ -254,7 +254,8 @@ if __name__ == '__main__':
     # Generate ground truth responses (Includes interactive visualization stages)
     model.generate_targets(
         resolution_high=(50, 20),   # Resolution for high-fidelity "truth" mesh
-        num_modes_save=5,           # Number of eigenmodes to calculate and match
+        num_modes_save=5,           # <<< NUMBER OF EIGENMODES TO MATCH >>>
+                                    # (e.g., 5 means matching the first 5 natural frequencies)
         target_config=target_config # The configuration defined above
     )
     
