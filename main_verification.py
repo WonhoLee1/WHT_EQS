@@ -279,18 +279,24 @@ if __name__ == '__main__':
         }
     }
     
-    # 5. Run Optimization Loop
-    # Fine-tune weights between matching static stiffness and dynamic frequencies.
+    # 5. Run Optimization Loop (loss_weights detailed configuration)
+    # Fine-tune the balance between matching physical behavior and meeting constraints.
     loss_weights = {
-        'static': 1.0,              # Importance of matching displacement fields
-        'freq': 0.2,                # Importance of matching natural frequencies
-        'mass': 0.05                # (Future) Penalty for mass deviation
+        # --- Physical Matching Weights ---
+        'static': 1.0,      # Error in displacement fields (W-displacement) for all load cases.
+        'freq': 0.2,        # Error in natural frequencies (eigenvalues). Matches target dynamics.
+        
+        # --- Constraint & Regularization Weights ---
+        'mass': 0.1,        # Penalty for deviation from target total mass. Ensures weight parity.
+        'smoothness': 0.01, # Total Variation (TV) penalty to prevent "checkerboard" patterns
+                            # and ensure physically manufacturable (smooth) parameter fields.
+        'regularization': 0.001 # L2 penalty on parameter magnitude (stability aid).
     }
     
     model.optimize(
         opt_config=opt_config, 
         loss_weights=loss_weights, 
-        max_iterations=100          # Number of gradient descent steps (Adam)
+        max_iterations=100  # Number of gradient descent steps (Adam)
     )
     
     # 6. Final Comparative Verification
