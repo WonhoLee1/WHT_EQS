@@ -114,9 +114,10 @@ class EquivalentSheetModel:
             
         print("Solving Target Eigenmodes...")
         vals, vecs = fem_high.solve_eigen(K_h, M_h, num_modes=num_modes_save + 10)
+        # Skip 6 rigid body modes for 6-DOF plate
         self.target_eigen = {
-            'vals': vals[3:3+num_modes_save],
-            'modes': vecs[0::3, 3:3+num_modes_save]
+            'vals': vals[6:6+num_modes_save],
+            'modes': vecs[2::6, 6:6+num_modes_save] # Extract W component (idx 2)
         }
         
         # Mass calculation for constraint
@@ -182,10 +183,11 @@ class EquivalentSheetModel:
                 fd, fv, F = case.get_bcs(self.fem)
                 free = jnp.setdiff1d(jnp.arange(self.fem.total_dof), fd)
                 u = self.fem.solve_static_partitioned(K, F, free, fd, fv)
-                l_static += jnp.mean((u[0::3] - self.targets_low[i]['u_static'])**2) * case.weight
+                # Compare W displacement (2nd index in 6-DOF, so u[2::6])
+                l_static += jnp.mean((u[2::6] - self.targets_low[i]['u_static'])**2) * case.weight
             
-            vals, vecs = self.fem.solve_eigen(K, M, num_modes=len(t_vals)+5)
-            l_freq = jnp.mean((vals[3:3+len(t_vals)] - t_vals)**2)
+            vals, vecs = self.fem.solve_eigen(K, M, num_modes=len(t_vals)+10)
+            l_freq = jnp.mean((vals[6:6+len(t_vals)] - t_vals)**2)
             
             return l_static * loss_weights['static'] + l_freq * loss_weights['freq']
 
