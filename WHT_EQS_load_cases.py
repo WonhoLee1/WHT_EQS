@@ -40,20 +40,19 @@ class TwistCase(LoadCase):
                 y_left = fem.node_coords[left_nodes, 1]
                 w_left = (y_left - yc) * np.tan(-angle_rad)
                 for i, node in enumerate(left_nodes):
-                    fixed_dofs.extend([node*6 + 2, node*6 + 3]) # w, tx
-                    fixed_vals.extend([w_left[i], -angle_rad])
+                    # LEFT GRIP: Fully Fixed (Anchor)
+                    # Fix w, tx (twist) + u, v, tz (rigid body anchor)
+                    fixed_dofs.extend([node*6 + 0, node*6 + 1, node*6 + 2, node*6 + 3, node*6 + 5]) 
+                    fixed_vals.extend([0.0, 0.0, w_left[i], -angle_rad, 0.0])
                 
                 y_right = fem.node_coords[right_nodes, 1]
                 w_right = (y_right - yc) * np.tan(angle_rad)
                 for i, node in enumerate(right_nodes):
-                    fixed_dofs.extend([node*6 + 2, node*6 + 3]) # w, tx
-                    fixed_vals.extend([w_right[i], angle_rad])
+                    # RIGHT GRIP: Release Axial (u)
+                    # Fix w, tx (twist) + v (prevent transverse)
+                    fixed_dofs.extend([node*6 + 1, node*6 + 2, node*6 + 3]) 
+                    fixed_vals.extend([0.0, w_right[i], angle_rad])
                 
-                # Rigid body constraints (u, v, tz)
-                n0 = 0
-                fixed_dofs.extend([n0*6+0, n0*6+1, n0*6+4, n0*6+5]) # u, v, ty, tz
-                fixed_vals.extend([0.0, 0.0, 0.0, 0.0])
-
         elif self.axis == 'y':
             bot_nodes = jnp.where(fem.node_coords[:, 1] < tol)[0]
             top_nodes = jnp.where(fem.node_coords[:, 1] > Ly - tol)[0]
@@ -64,19 +63,18 @@ class TwistCase(LoadCase):
                 x_bot = fem.node_coords[bot_nodes, 0]
                 w_bot = (x_bot - xc) * np.tan(-angle_rad)
                 for i, node in enumerate(bot_nodes):
-                    fixed_dofs.extend([node*6 + 2, node*6 + 4]) # w, ty
-                    fixed_vals.extend([w_bot[i], -angle_rad])
+                    # BOTTOM GRIP: Fully Fixed (Anchor)
+                    # Fix w, ty (twist) + u, v, tz (rigid body anchor)
+                    fixed_dofs.extend([node*6 + 0, node*6 + 1, node*6 + 2, node*6 + 4, node*6 + 5])
+                    fixed_vals.extend([0.0, 0.0, w_bot[i], -angle_rad, 0.0])
                 
                 x_top = fem.node_coords[top_nodes, 0]
                 w_top = (x_top - xc) * np.tan(angle_rad)
                 for i, node in enumerate(top_nodes):
-                    fixed_dofs.extend([node*6 + 2, node*6 + 4]) # w, ty
-                    fixed_vals.extend([w_top[i], angle_rad])
-                
-                # Rigid body
-                n0 = 0
-                fixed_dofs.extend([n0*6+0, n0*6+1, n0*6+3, n0*6+5]) # u, v, tx, tz
-                fixed_vals.extend([0.0, 0.0, 0.0, 0.0])
+                    # TOP GRIP: Release Axial (v)
+                    # Fix w, ty (twist) + u (prevent transverse)
+                    fixed_dofs.extend([node*6 + 0, node*6 + 2, node*6 + 4]) 
+                    fixed_vals.extend([0.0, w_top[i], angle_rad])
 
         return jnp.array(fixed_dofs), jnp.array(fixed_vals), F
 
@@ -103,15 +101,15 @@ class PureBendingCase(LoadCase):
             if self.mode == 'angle':
                 angle_rad = self.value * np.pi / 180.0
                 for node in left_nodes:
-                    fixed_dofs.extend([node*6+2, node*6+4]) # w, ty
-                    fixed_vals.extend([0.0, angle_rad]) 
+                    # LEFT GRIP: Fully Fixed (Anchor)
+                    # Fix w, ty (bend) + u, v, tz (rigid body)
+                    fixed_dofs.extend([node*6+0, node*6+1, node*6+2, node*6+4, node*6+5])
+                    fixed_vals.extend([0.0, 0.0, 0.0, angle_rad, 0.0]) 
                 for node in right_nodes:
-                    fixed_dofs.extend([node*6+2, node*6+4]) # w, ty
-                    fixed_vals.extend([0.0, -angle_rad])
-                # Rigid body
-                n0 = 0
-                fixed_dofs.extend([n0*6+0, n0*6+1, n0*6+3, n0*6+5]) # u, v, tx, tz
-                fixed_vals.extend([0.0, 0.0, 0.0, 0.0])
+                    # RIGHT GRIP: Release Axial (u)
+                    # Fix w, ty (bend) + v (transverse)
+                    fixed_dofs.extend([node*6+1, node*6+2, node*6+4])
+                    fixed_vals.extend([0.0, 0.0, -angle_rad])
                 
         elif self.axis == 'x':
             bot_nodes = jnp.where(fem.node_coords[:, 1] < tol)[0]
@@ -119,17 +117,19 @@ class PureBendingCase(LoadCase):
             if self.mode == 'angle':
                 angle_rad = self.value * np.pi / 180.0
                 for node in bot_nodes:
-                     fixed_dofs.extend([node*6+2, node*6+3]) # w, tx
-                     fixed_vals.extend([0.0, -angle_rad])
+                     # BOTTOM GRIP: Fully Fixed (Anchor)
+                     # Fix w, tx (bend) + u, v, tz (rigid body)
+                     fixed_dofs.extend([node*6+0, node*6+1, node*6+2, node*6+3, node*6+5])
+                     fixed_vals.extend([0.0, 0.0, 0.0, -angle_rad, 0.0])
                 for node in top_nodes:
-                     fixed_dofs.extend([node*6+2, node*6+3]) # w, tx
-                     fixed_vals.extend([0.0, angle_rad])
-                # Rigid body
-                n0 = 0
-                fixed_dofs.extend([n0*6+0, n0*6+1, n0*6+4, n0*6+5]) # u, v, ty, tz
-                fixed_vals.extend([0.0, 0.0, 0.0, 0.0])
+                     # TOP GRIP: Release Axial (v)
+                     # Fix w, tx (bend) + u (transverse)
+                     fixed_dofs.extend([node*6+0, node*6+2, node*6+3])
+                     fixed_vals.extend([0.0, 0.0, angle_rad])
 
         return jnp.array(fixed_dofs), jnp.array(fixed_vals), F
+
+
 
 # ==============================================================================
 # CORNER LIFT LOAD CASE (6-DOF Aligned)

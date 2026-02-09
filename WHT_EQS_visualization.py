@@ -71,6 +71,7 @@ def setup_plotter(title="Visualization", shape=(1, 1)):
     p = pv.Plotter(title=title, shape=shape)
     p.set_background("white")
     pv.set_plot_theme('document')  # Professional appearance with sans-serif fonts
+    p.add_axes()
     return p
 
 
@@ -203,7 +204,7 @@ def stage1_visualize_patterns(nx, ny, x_grid, y_grid, t_field, z_field):
 # STAGE 2: POST-GENERATION RESULTS VIEWER
 # ==============================================================================
 
-def stage2_visualize_ground_truth(fem, targets, params):
+def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
     """
     [STAGE 2] Interactive visualization of ground truth analysis results.
     
@@ -253,6 +254,9 @@ def stage2_visualize_ground_truth(fem, targets, params):
     y = np.array(fem.node_coords[:, 1])
     z = np.array(params['z']).flatten()
     
+    # Default deformation scale
+    scale = 5.0
+    
     # Interactive menu loop
     while True:
         print("\n" + "="*70)
@@ -264,10 +268,58 @@ def stage2_visualize_ground_truth(fem, targets, params):
         for idx, tgt in enumerate(targets):
             print(f" {idx+1}: {tgt['case_name']}")
         
+        print(f" S: Set Deformation Scale (Current: {scale:.1f}x)")
+        if eigen_data:
+            print(" M: View Eigenmodes (Vibration Analysis)")
         print(" 0: Cancel / Continue to Optimization (or press Enter)")
         print("="*70)
-        choice = input(">> Select load case number [0-{}]: ".format(len(targets))).strip()
+        choice = input(">> Select choice: ").strip()
         
+        # Handle Eigenmode Visualization
+        if choice.lower() == 'm' and eigen_data:
+            vals = eigen_data['vals']
+            modes = eigen_data['modes']
+            
+            print("\n Available Modes:")
+            for i, val in enumerate(vals):
+                freq_hz = np.sqrt(max(0, val)) / (2 * np.pi)
+                print(f" Mode {i+1}: {freq_hz:.2f} Hz")
+                
+            try:
+                m_idx = int(input(">> Select Mode Number: ")) - 1
+                if 0 <= m_idx < len(vals):
+                    freq_hz = np.sqrt(max(0, vals[m_idx])) / (2 * np.pi)
+                    
+                    # Prepare Mesh for Mode Shape
+                    w_mode = np.array(modes[:, m_idx])
+                    grid = pv.StructuredGrid()
+                    z_deformed = z + w_mode * scale # Use current scale
+                    grid.points = np.column_stack([x, y, z_deformed])
+                    grid.dimensions = [ny + 1, nx + 1, 1]
+                    grid["Mode Shape"] = w_mode
+                    
+                    # Plot
+                    title = f"Mode {m_idx+1}: {freq_hz:.2f} Hz (Scale: {scale}x)"
+                    p = setup_plotter(title)
+                    p.add_mesh(grid, scalars="Mode Shape", show_edges=True, cmap="coolwarm")
+                    p.add_text(f"Frequency: {freq_hz:.2f} Hz", position='upper_right', font_size=10, color='black')
+                    p.show()
+                else:
+                    print("⚠ Invalid mode number.")
+            except ValueError:
+                print("⚠ Invalid input.")
+            continue
+        
+        # Handle Scale Change
+        if choice.lower() == 's':
+            try:
+                new_scale = float(input(f"Enter new scale factor (current: {scale}): "))
+                scale = new_scale
+                print(f"✓ Scale updated to {scale}x")
+            except ValueError:
+                print("⚠ Invalid input. Scale unchanged.")
+            continue
+
         # Exit on 0 or empty input
         if not choice or choice == '0':
             print("✓ Proceeding to optimization...")
@@ -281,39 +333,149 @@ def stage2_visualize_ground_truth(fem, targets, params):
                 continue
             tgt = targets[sel_idx]
         except ValueError:
-            print("⚠ Invalid input. Please enter a number.")
+            print("⚠ Invalid input. Please enter a number or 'S'.")
             continue
         
-        # Extract displacement field (Already pre-extracted as w field in main script)
-        w = np.array(tgt['u_static'])
+        # Sub-menu for Result Type
+        print("-" * 50)
+        print(" Select Result Type to Visualize:")
+        print("  A: Displacement (W-Component)")
+        print("  B: Equivalent Strain (Max Surface)")
+        print("  C: Equivalent Stress (Max Surface)")
+        print("-" * 50)
+        type_choice = input(">> Select Type [A/B/C] (Default: A): ").strip().upper()
         
-        # Create deformed mesh with magnification for visualization
-        scale = 30.0  # Deformation magnification factor (adjust as needed)
+        # Default to A
+        if not type_choice:
+            type_choice = 'A'
+            
+        if type_choice not in ['A', 'B', 'C']:
+            print("⚠ Invalid type. Defaulting to Displacement (A).")
+            type_choice = 'A'
+
+        # Select Data Field
+        if type_choice == 'A':
+            field_name = "W-Displacement (mm)"
+            scalars = np.array(tgt['u_static'])
+            cmap = 'jet'
+            title_prefix = "Displacement"
+        elif type_choice == 'B':
+            field_name = "Max Surface Strain (-)"
+            scalars = np.array(tgt['max_surface_strain'])
+            cmap = 'plasma'
+            title_prefix = "Strain"
+        elif type_choice == 'C':
+            field_name = "Max Surface Stress (MPa)"
+            scalars = np.array(tgt['max_surface_stress'])
+            cmap = 'inferno'
+            title_prefix = "Stress"
+
+        # Compute Summary Statistics (Displayed on Screen)
+        # 1. Total Reaction Force (Sum of R components)
+        if 'reaction_full' in tgt:
+            R = tgt['reaction_full'] # (6*N)
+            Rx_sum = np.sum(R[0::6])
+            Ry_sum = np.sum(R[1::6])
+            Rz_sum = np.sum(R[2::6])
+            
+            # 2. Average Displacement (Mean of U components)
+            U = tgt['u_full'] # (6*N)
+            Ux_avg = np.mean(U[0::6])
+            Uy_avg = np.mean(U[1::6])
+            Uz_avg = np.mean(U[2::6])
+            
+            stats_text = (
+                "SUMMARY STATISTICS:\n"
+                f"Total Reaction Force: Rx={Rx_sum:.2e}, Ry={Ry_sum:.2e}, Rz={Rz_sum:.2e} (N)\n"
+                f"Avg Displacement:     Ux={Ux_avg:.2e}, Uy={Uy_avg:.2e}, Uz={Uz_avg:.2e} (mm)"
+            )
+        else:
+            stats_text = "Statistics not available (Run with updated main_verification.py)"
+
+        # Prepare Mesh
+        w_disp = np.array(tgt['u_static'])
         grid = pv.StructuredGrid()
-        grid.points = np.column_stack([
-            x,  # Original X coordinates
-            y,  # Original Y coordinates
-            z + w * scale  # Deformed Z = original Z + magnified displacement
-        ])
+        z_deformed = z + w_disp * scale
+        grid.points = np.column_stack([x, y, z_deformed])
         grid.dimensions = [ny + 1, nx + 1, 1]
-        grid["Vertical_Displacement"] = w
+        grid[field_name] = scalars
         
-        # Setup plotter with descriptive title
-        title = f"Ground Truth: {tgt['case_name']} (Deformed Shape, {scale}x magnification)"
+        # Setup Plotter
+        title = f"{title_prefix}: {tgt['case_name']} (Scale: {scale}x)"
         p = setup_plotter(title)
         
-        # Add mesh with contour coloring
         p.add_mesh(
             grid, 
-            scalars="Vertical_Displacement", 
+            scalars=field_name, 
             show_edges=True, 
-            cmap="jet",  # Rainbow colormap for displacement
+            cmap=cmap, 
             scalar_bar_args={
-                'title': "W-Displacement (mm)", 
+                'title': field_name, 
                 'label_font_size': 9,
                 'title_font_size': 10
             }
         )
+        
+        # Add Statistics Text (8pt)
+        p.add_text(
+            stats_text,
+            position='upper_right',
+            font_size=8,
+            color='black',
+            font='courier',
+            shadow=False
+        )
+
+        
+        # VISUALIZE BOUNDARY CONDITIONS (Bold Blue Points)
+        if 'fixed_dofs' in tgt:
+            fixed_dofs = tgt['fixed_dofs']
+            # Map DOFs to nodes (integer division by 6)
+            fixed_nodes = np.unique(fixed_dofs // 6)
+            
+            # Extract coordinates for fixed nodes
+            bc_coords = np.column_stack([
+                x[fixed_nodes], 
+                y[fixed_nodes], 
+                z_deformed[fixed_nodes]
+            ])
+            
+            # Add BC points
+            p.add_points(
+                bc_coords, 
+                color="blue", 
+                point_size=15, 
+                render_points_as_spheres=True,
+                name="Boundary_Conditions"
+            )
+            p.add_text("Blue Points: Fixed BCs", position='upper_left', font_size=8, color='blue')
+
+        # VISUALIZE LOADS (Red Points)
+        if 'force_vector' in tgt:
+            F = tgt['force_vector']
+            # Find nodes with non-zero force magnitude
+            F_reshaped = F.reshape(-1, 6)
+            # Check magnitude of force (translational + rotational)
+            force_mag = np.linalg.norm(F_reshaped[:, :3], axis=1) # check translational forces
+            moment_mag = np.linalg.norm(F_reshaped[:, 3:], axis=1) # check moments
+            loaded_nodes = np.where((force_mag > 1e-6) | (moment_mag > 1e-6))[0]
+            
+            if len(loaded_nodes) > 0:
+                load_coords = np.column_stack([
+                    x[loaded_nodes], 
+                    y[loaded_nodes], 
+                    z_deformed[loaded_nodes]
+                ])
+                
+                # Add Load points
+                p.add_points(
+                    load_coords, 
+                    color="red", 
+                    point_size=15, 
+                    render_points_as_spheres=True,
+                    name="Loads"
+                )
+                p.add_text("Red Points: Applied Loads", position='upper_right', font_size=8, color='red')
         
         # Add informative text overlay
         p.add_text(
