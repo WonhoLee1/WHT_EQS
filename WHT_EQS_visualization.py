@@ -493,7 +493,7 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
 # STAGE 3: POST-OPTIMIZATION COMPARISON
 # ==============================================================================
 
-def stage3_visualize_comparison(fem_high, targets, optimized_params, target_params):
+def stage3_visualize_comparison(fem_high, targets, optimized_params, target_params, opt_eigen=None, tgt_eigen=None):
     """
     [STAGE 3] Interactive side-by-side comparison of target vs optimized results.
     
@@ -562,9 +562,11 @@ def stage3_visualize_comparison(fem_high, targets, optimized_params, target_para
         print(" Compare target and optimized parameters side-by-side")
         print(" 1: Compare Thickness Fields (Target vs Optimized)")
         print(" 2: Compare Z-Shape Fields (Target vs Optimized)")
+        if opt_eigen and tgt_eigen:
+            print(" 3: Compare Eigenmodes (Frequencies & Shapes)")
         print(" 0: Cancel / Exit Program (or press Enter)")
         print("="*70)
-        choice = input(">> Your choice [0-2]: ").strip()
+        choice = input(">> Your choice [0-3]: ").strip()
         
         # Exit on 0 or empty input
         if not choice or choice == '0':
@@ -588,8 +590,28 @@ def stage3_visualize_comparison(fem_high, targets, optimized_params, target_para
             data_optimized = np.array(optimized_params['z']).flatten()
             field_name = "Z-Height"
             units = "mm"
+            cmap = "viridis"
+        elif choice == '3' and opt_eigen and tgt_eigen:
+            # Mode Shape Selection
+            print("\n Select Mode for Comparison:")
+            for i in range(len(tgt_eigen['vals'])):
+                f_t = np.sqrt(max(0, tgt_eigen['vals'][i])) / (2*np.pi)
+                f_o = np.sqrt(max(0, opt_eigen['vals'][i])) / (2*np.pi)
+                print(f" Mode {i+1}: Target={f_t:.1f}Hz, Opt={f_o:.1f}Hz")
+            try:
+                m_idx = int(input(">> Mode number: ")) - 1
+                data_target = tgt_eigen['modes'][:, m_idx]
+                data_optimized = opt_eigen['modes'][:, m_idx]
+                f_target = np.sqrt(max(0, tgt_eigen['vals'][m_idx])) / (2*np.pi)
+                f_opt = np.sqrt(max(0, opt_eigen['vals'][m_idx])) / (2*np.pi)
+                field_name = f"Mode_{m_idx+1}_Shape"
+                units = "Rel"
+                cmap = "coolwarm"
+            except:
+                print("⚠ Invalid mode selection.")
+                continue
         else:
-            print("⚠ Invalid choice. Please enter 1, 2, or 0.")
+            print("⚠ Invalid choice.")
             continue
 
         # Helper function to add mesh to specific subplot
@@ -621,7 +643,7 @@ def stage3_visualize_comparison(fem_high, targets, optimized_params, target_para
                 grid, 
                 scalars=field_name, 
                 show_edges=True, 
-                cmap="viridis",
+                cmap=cmap, # Use dynamic cmap (viridis or coolwarm)
                 scalar_bar_args={
                     'label_font_size': 9, 
                     'title_font_size': 10,
@@ -638,8 +660,14 @@ def stage3_visualize_comparison(fem_high, targets, optimized_params, target_para
             )
 
         # Add both meshes (left=target, right=optimized)
-        add_comparison_mesh(p, 0, data_target, "TARGET")
-        add_comparison_mesh(p, 1, data_optimized, "OPTIMIZED")
+        title_l = "TARGET"
+        title_r = "OPTIMIZED"
+        if choice == '3':
+            title_l += f" ({f_target:.2f} Hz)"
+            title_r += f" ({f_opt:.2f} Hz)"
+            
+        add_comparison_mesh(p, 0, data_target, title_l)
+        add_comparison_mesh(p, 1, data_optimized, title_r)
         
         # Link camera views for synchronized rotation/zoom
         p.link_views()

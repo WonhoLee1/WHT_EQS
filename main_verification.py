@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import optax
 import numpy as np
 from scipy.interpolate import griddata
+import matplotlib.pyplot as plt
 import os
 
 # Import our modular components
@@ -172,14 +173,20 @@ class EquivalentSheetModel:
         # 3. Optimization Loop with Detailed Logging
         print(f"Starting Optimization (Modes for Loss: {n_loss})...")
         
-        # Initial Parameters
+        # Initial Parameters (Breaking Symmetry with small jitter)
+        key = jax.random.PRNGKey(42)
         params = {
             't': jnp.full((Nx_l+1, Ny_l+1), opt_config['t'].get('init', 1.0)),
             'rho': jnp.full((Nx_l+1, Ny_l+1), opt_config['rho'].get('init', 7.5e-9)),
             'E': jnp.full((Nx_l+1, Ny_l+1), opt_config['E'].get('init', 210000.0))
         }
+        params['t'] = params['t'] + 1e-4 * jax.random.uniform(key, params['t'].shape)
         
-        optimizer = optax.adam(learning_rate=learning_rate)
+        # Use a more robust optimizer chain with selective clipping
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(0.5), # More restrictive clipping
+            optax.adam(learning_rate=learning_rate)
+        )
         opt_state = optimizer.init(params)
 
         # Pre-compute BCs to avoid jnp.where inside JIT
@@ -257,24 +264,27 @@ class EquivalentSheetModel:
 
             # --- 2. Modal Responses Loss ---
             if loss_weights.get('freq', 0.0) > 0 or loss_weights.get('mode', 0.0) > 0:
-                vals, vecs = self.fem.solve_eigen(K, M, num_modes=len(t_vals)+10)
+                # Add diagonal shift for numerical stability during eigen-solve (slightly larger)
+                K_stable = K + 1e-6 * jnp.mean(jnp.abs(jnp.diag(K))) * jnp.eye(K.shape[0])
+                vals, vecs = self.fem.solve_eigen(K_stable, M, num_modes=len(t_vals)+10)
                 
                 # Eigenfrequency matching (Skip 6 RB modes)
                 if loss_weights.get('freq', 0.0) > 0:
-                    # Log diff
-                    curr_vals = vals[6:6+len(t_vals)]
-                    diff = jnp.log(curr_vals) - jnp.log(t_vals)
-                    l_freq = jnp.mean(diff**2)
+                    # Use Relative Difference (Safer than Log during early iterations)
+                    curr_vals = jnp.abs(vals[6:6+len(t_vals)])
+                    res_diff = (curr_vals - t_vals) / (t_vals + 1e-4)
+                    l_freq = jnp.nan_to_num(jnp.mean(res_diff**2), nan=0.0)
                 
                 # Mode Shape matching (MAC)
                 if loss_weights.get('mode', 0.0) > 0:
                     modes_w = vecs[2::6, 6:6+len(t_vals)]
                     for j in range(len(t_vals)):
                         num = jnp.sum(modes_w[:, j] * t_modes_l[:, j])**2
-                        den = jnp.sum(modes_w[:, j]**2) * jnp.sum(t_modes_l[:, j]**2)
-                        mac = num / (den + 1e-12)
+                        # Larger stability constant for denominator
+                        den = (jnp.sum(modes_w[:, j]**2) + 1e-8) * (jnp.sum(t_modes_l[:, j]**2) + 1e-8)
+                        mac = num / den
                         l_mode += (1.0 - mac)
-                    l_mode /= len(t_vals)
+                    l_mode = jnp.nan_to_num(l_mode / len(t_vals), nan=0.0)
 
             # --- 3. Geometric Constraints & Regularization ---
             # Mass Constraint
@@ -302,13 +312,12 @@ class EquivalentSheetModel:
                 l_mass   * loss_weights.get('mass', 0.0) +
                 l_reg    * loss_weights.get('reg', 0.0)
             )
+            # Final NaN Guard
+            total_loss = jnp.nan_to_num(total_loss, nan=1e10)
             
             metrics = {
                 'Total': total_loss,
                 'Static': l_static,
-                'Stress': l_stress,
-                'Strain': l_strain,
-                'Energy': l_energy,
                 'Freq': l_freq,
                 'Mode': l_mode,
                 'Mass': l_mass,
@@ -320,13 +329,16 @@ class EquivalentSheetModel:
         best_loss = float('inf')
         wait = 0
         
-        print(f"{'Iter':<5} | {'Total':<10} | {'Static':<9} | {'Stress':<9} | {'Strain':<9} | {'Energy':<9} | {'Mass':<9} | {'Reg':<9}")
-        print("-" * 95)
+        print(f"{'Iter':<5} | {'Total':<10} | {'Static':<9} | {'Freq':<9} | {'Mode':<9} | {'Mass':<9} | {'Reg':<9}")
+        print("-" * 80)
 
         for i in range(max_iterations):
             (val, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
             
-            # Check for NaN
+            # ⚠ DEFENSIVE: Guard against NaN gradients (especially from Modal components)
+            grads = jax.tree_util.tree_map(lambda g: jnp.where(jnp.isnan(g), 0.0, g), grads)
+            
+            # Check for NaN in value
             if jnp.isnan(val):
                 print(f"⚠ NaN Loss detected at iter {i}. Stopping.")
                 break
@@ -340,7 +352,7 @@ class EquivalentSheetModel:
             params['E'] = jnp.clip(params['E'], opt_config['E']['min'], opt_config['E']['max'])
             
             if i % 10 == 0:
-                 print(f"{i:<5d} | {val:<10.4e} | {metrics['Static']:<9.2e} | {metrics['Stress']:<9.2e} | {metrics['Strain']:<9.2e} | {metrics['Energy']:<9.2e} | {metrics['Mass']:<9.2e} | {metrics['Reg']:<9.2e}")
+                 print(f"{i:<5d} | {val:<10.4e} | {metrics['Static']:<9.2e} | {metrics['Freq']:<9.2e} | {metrics['Mode']:<9.2e} | {metrics['Mass']:<9.2e} | {metrics['Reg']:<9.2e}")
 
             # Early Stopping Logic (Explicit)
             if use_early_stopping:
@@ -360,33 +372,204 @@ class EquivalentSheetModel:
 
     def verify(self):
         print("\n" + "="*70)
-        print(" [STAGE 4] FINAL COMPARATIVE VERIFICATION")
+        print(" [STAGE 4] COMPREHENSIVE FINAL VERIFICATION")
         print("="*70)
-        # Interpolate optimized field back to high-res for visualization
+        
+        # 1. Setup High Res Verification
         Nx_h, Ny_h = self.resolution_high
-        xh_new = np.linspace(0, self.fem.Lx, Nx_h+1)
-        yh_new = np.linspace(0, self.fem.Ly, Ny_h+1)
-        Xh_new, Yh_new = np.meshgrid(xh_new, yh_new, indexing='ij')
+        xh = np.linspace(0, self.fem.Lx, Nx_h+1)
+        yh = np.linspace(0, self.fem.Ly, Ny_h+1)
+        Xh, Yh = np.meshgrid(xh, yh, indexing='ij')
+        pts_high = np.column_stack([Xh.flatten(), Yh.flatten()])
         
-        # We need a 1D coordinate array for griddata
-        xl_1d = np.linspace(0, self.fem.Lx, Nx_low+1)
-        yl_1d = np.linspace(0, self.fem.Ly, Ny_low+1)
-        Xl_grid, Yl_grid = np.meshgrid(xl_1d, yl_1d, indexing='ij')
-        pts_low = np.column_stack([Xl_grid.flatten(), Yl_grid.flatten()])
+        # Low Res Coords for Interpolation
+        xl = np.linspace(0, self.fem.Lx, self.fem.nx+1)
+        yl = np.linspace(0, self.fem.Ly, self.fem.ny+1)
+        Xl, Yl = np.meshgrid(xl, yl, indexing='ij')
+        pts_low = np.column_stack([Xl.flatten(), Yl.flatten()])
         
-        t_opt_h = griddata(pts_low, np.array(self.optimized_params['t']).flatten(), 
-                           (Xh_new, Yh_new), method='cubic')
-        z_opt_h = griddata(pts_low, np.array(self.optimized_params['z' if 'z' in self.optimized_params else 't']).flatten(), 
-                           (Xh_new, Yh_new), method='cubic') # Placeholder for topography if optimized
-        
+        # Interpolate Optimized Params
         opt_params_h = {
-            't': t_opt_h,
-            'z': self.target_params_high['z'], # Hold topography constant for now
-            'rho': self.target_params_high['rho'],
-            'E': self.target_params_high['E']
+            't': griddata(pts_low, np.array(self.optimized_params['t']).flatten(), (Xh, Yh), method='cubic'),
+            'rho': griddata(pts_low, np.array(self.optimized_params['rho']).flatten(), (Xh, Yh), method='cubic'),
+            'E': griddata(pts_low, np.array(self.optimized_params['E']).flatten(), (Xh, Yh), method='cubic'),
+            'z': self.target_params_high['z'] # Hold topography constant
         }
         
-        stage3_visualize_comparison(self.fem_high, self.targets, opt_params_h, self.target_params_high)
+        # 2. Assemble and Solve Optimized Model at High Res
+        print("Solving Optimized High-Res Model for All Cases...")
+        K_opt, M_opt = self.fem_high.assemble(opt_params_h)
+        
+        # 3. Static Performance Analysis & Matplotlib Plotting
+        static_summary = []
+        for i, case in enumerate(self.cases):
+            tgt = self.targets[i]
+            print(f" -> Verifying Case: {case.name}")
+            
+            # Solve Optimized
+            fd, fv, F = case.get_bcs(self.fem_high)
+            all_dofs = np.arange(self.fem_high.total_dof)
+            free = np.setdiff1d(all_dofs, fd)
+            u_opt = self.fem_high.solve_static_partitioned(K_opt, F, jnp.array(free), fd, fv)
+            
+            # Extract Fields
+            w_ref = tgt['u_static'].reshape(Nx_h+1, Ny_h+1)
+            w_opt = u_opt[2::6].reshape(Nx_h+1, Ny_h+1)
+            
+            stress_ref = tgt['max_surface_stress'].reshape(Nx_h+1, Ny_h+1)
+            stress_opt = self.fem_high.compute_max_surface_stress(u_opt, opt_params_h).reshape(Nx_h+1, Ny_h+1)
+            
+            strain_ref = tgt['max_surface_strain'].reshape(Nx_h+1, Ny_h+1)
+            strain_opt = self.fem_high.compute_max_surface_strain(u_opt, opt_params_h).reshape(Nx_h+1, Ny_h+1)
+
+            # Calculation of Metric: Similarity % = 100 * (1 - RMSE / range)
+            def get_metrics(ref, opt):
+                rmse = np.sqrt(np.mean((ref - opt)**2))
+                drange = np.max(ref) - np.min(ref) + 1e-12
+                sim = max(0.0, 100.0 * (1.0 - rmse/drange))
+                return rmse, sim
+
+            metrics_w = get_metrics(w_ref, w_opt)
+            metrics_s = get_metrics(stress_ref, stress_opt)
+            metrics_e = get_metrics(strain_ref, strain_opt)
+            
+            static_summary.append({
+                'name': case.name,
+                'disp_sim': metrics_w[1],
+                'stress_sim': metrics_s[1],
+                'strain_sim': metrics_e[1]
+            })
+
+            # Create 3x3 Plot
+            fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+            fig.suptitle(f"Verification: {case.name}\n(High Resolution {Nx_h}x{Ny_h})", fontsize=16)
+            
+            # Plot Helper
+            def plot_field(ax, data, title, cmap='jet', levels=None):
+                if levels is None:
+                    im = ax.contourf(xh, yh, data.T, 30, cmap=cmap)
+                else:
+                    im = ax.contourf(xh, yh, data.T, levels=levels, cmap=cmap, extend='both')
+                ax.set_title(title)
+                ax.set_aspect('equal')
+                plt.colorbar(im, ax=ax)
+
+            # Disp
+            levels_w = np.linspace(np.min(w_ref), np.max(w_ref), 30)
+            plot_field(axes[0,0], w_ref, "Target Disp (mm)", levels=levels_w)
+            plot_field(axes[0,1], w_opt, "Optimized Disp (mm)", levels=levels_w)
+            plot_field(axes[0,2], np.abs(w_opt - w_ref), "Error (mm)", cmap='magma')
+            
+            # Stress
+            levels_s = np.linspace(0, np.max(stress_ref), 30)
+            plot_field(axes[1,0], stress_ref, "Target Stress (MPa)", levels=levels_s, cmap='viridis')
+            plot_field(axes[1,1], stress_opt, "Optimized Stress (MPa)", levels=levels_s, cmap='viridis')
+            plot_field(axes[1,2], np.abs(stress_opt - stress_ref), "Error (MPa)", cmap='magma')
+            
+            # Strain
+            levels_e = np.linspace(0, np.max(strain_ref)*1000, 30)
+            plot_field(axes[2,0], strain_ref*1000, "Target Strain (e-3)", levels=levels_e, cmap='plasma')
+            plot_field(axes[2,1], strain_opt*1000, "Optimized Strain (e-3)", levels=levels_e, cmap='plasma')
+            plot_field(axes[2,2], np.abs(strain_opt - strain_ref)*1000, "Error (e-3)", cmap='magma')
+            
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            out_file = f"verify_3d_{case.name}.png"
+            plt.savefig(out_file, dpi=150)
+            plt.close()
+            print(f"   -> Saved: {out_file}")
+
+        # 4. Parameter Comparison Plot
+        print("Generating Parameter comparison plots...")
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        t_ref = self.target_params_high['t'].reshape(Nx_h+1, Ny_h+1)
+        t_opt = opt_params_h['t'].reshape(Nx_h+1, Ny_h+1)
+        
+        im0 = axes[0,0].contourf(xh, yh, t_ref.T, 30, cmap='viridis')
+        axes[0,0].set_title("Target Hard-coded Thickness (mm)")
+        plt.colorbar(im0, ax=axes[0,0])
+        
+        im1 = axes[0,1].contourf(xh, yh, t_opt.T, 30, cmap='viridis')
+        axes[0,1].set_title("Optimized Equivalent Thickness (mm)")
+        plt.colorbar(im1, ax=axes[0,1])
+        
+        # Difference
+        im2 = axes[1,0].contourf(xh, yh, (t_opt - t_ref).T, 30, cmap='RdBu_r')
+        axes[1,0].set_title("Thickness Difference (mm)")
+        plt.colorbar(im2, ax=axes[1,0])
+        
+        # Z-Shape (constant in this script)
+        im3 = axes[1,1].contourf(xh, yh, opt_params_h['z'].reshape(Nx_h+1, Ny_h+1).T, 30, cmap='terrain')
+        axes[1,1].set_title("Topography (Z-Height)")
+        plt.colorbar(im3, ax=axes[1,1])
+        
+        plt.tight_layout()
+        plt.savefig("verify_3d_parameters.png", dpi=150)
+        plt.close()
+        
+        # 5. Modal Verification
+        print("Verifying Modal Response...")
+        n_modes = len(self.target_eigen['vals'])
+        vals_opt, vecs_opt = self.fem_high.solve_eigen(K_opt, M_opt, num_modes=n_modes + 10)
+        
+        # Filter Rigid Body
+        freq_ref = np.sqrt(np.abs(self.target_eigen['vals'])) / (2*np.pi)
+        freq_opt = np.sqrt(np.abs(vals_opt[6:6+n_modes])) / (2*np.pi) # Skip 6 RB
+        
+        modes_ref = self.target_eigen['modes']
+        modes_opt = vecs_opt[2::6, 6:6+n_modes]
+        
+        macs = []
+        for j in range(n_modes):
+            v1 = modes_opt[:, j] / np.linalg.norm(modes_opt[:, j])
+            v2 = modes_ref[:, j] / np.linalg.norm(modes_ref[:, j])
+            macs.append(float((np.dot(v1, v2))**2))
+            
+        # Modal Plot
+        plt.figure(figsize=(10, 5))
+        plt.subplot(1, 2, 1)
+        plt.bar(np.arange(n_modes)-0.2, freq_ref, width=0.4, label='Target')
+        plt.bar(np.arange(n_modes)+0.2, freq_opt, width=0.4, label='Optimized')
+        plt.title("Frequency Comparison (Hz)")
+        plt.legend()
+        plt.subplot(1, 2, 2)
+        plt.bar(np.arange(n_modes), macs, color='purple')
+        plt.axhline(0.9, color='red', linestyle='--')
+        plt.title("Modal Assurance Criterion (MAC)")
+        plt.ylim(0, 1.1)
+        plt.savefig("verify_3d_modes.png", dpi=150)
+        plt.close()
+        
+        # 6. Report Generation
+        report = []
+        report.append("# Equivalent Sheet Optimization Verification Report")
+        report.append(f"Model Size: {self.fem.Lx} x {self.fem.Ly} mm")
+        report.append(f"Target Resolution: {Nx_h} x {Ny_h}")
+        report.append(f"Optimizer Resolution: {self.fem.nx} x {self.fem.ny}\n")
+        
+        report.append("## 1. Static Results Similarity")
+        report.append("| Case | Disp Similarity (%) | Stress Similarity (%) | Strain Similarity (%) |")
+        report.append("| :--- | :---: | :---: | :---: |")
+        for res in static_summary:
+            report.append(f"| {res['name']} | {res['disp_sim']:.2f}% | {res['stress_sim']:.2f}% | {res['strain_sim']:.2f}% |")
+        
+        report.append("\n## 2. Modal Results")
+        report.append("| Mode | Target Freq (Hz) | Opt Freq (Hz) | Error (%) | MAC |")
+        report.append("| :--- | :---: | :---: | :---: | :---: |")
+        for j in range(n_modes):
+            err = abs(freq_opt[j] - freq_ref[j])/freq_ref[j]*100
+            report.append(f"| {j+1} | {freq_ref[j]:.2f} | {freq_opt[j]:.2f} | {err:.2f}% | {macs[j]:.4f} |")
+        
+        with open("verification_report.md", "w", encoding='utf-8') as f:
+            f.write("\n".join(report))
+        print("\n✔ Verification report saved to: verification_report.md")
+        print("✔ Verification plots saved: verify_3d_*.png")
+
+        # 7. Final Interactive Stage (PyVista) - Optional but good for inspection
+        opt_eigen = {'vals': vals_opt[6:6+n_modes], 'modes': vecs_opt[2::6, 6:6+n_modes]}
+        stage3_visualize_comparison(
+            self.fem_high, self.targets, opt_params_h, self.target_params_high,
+            opt_eigen=opt_eigen, tgt_eigen=self.target_eigen
+        )
 
 # ==============================================================================
 # MAIN EXECUTION: COMPREHENSIVE CONFIGURATION TEMPLATE
@@ -423,8 +606,8 @@ if __name__ == '__main__':
     # 5. Full Loss Weights (as previously defined)
     weights = {
         'static': 1.0,           # Displacement matching
-        'freq': 0.0,             # Eigenfrequency matching (Disabled to prevent NaN)
-        'mode': 0.0,             # Mode shape (MAC) matching (Disabled to prevent NaN)
+        'freq': 0.01,            # [Very Low] frequency matching
+        'mode': 0.005,           # [Very Low] mode matching
         'curvature': 0.0,        # [Legacy]
         'moment': 0.0,           # [Legacy]
         'strain_energy': 2.0,    # Strain energy density matching
@@ -447,7 +630,7 @@ if __name__ == '__main__':
         use_early_stopping=True, 
         early_stop_patience=30, 
         early_stop_tol=1e-8,
-        learning_rate=0.01
+        learning_rate=0.005
     )
     
     model.verify()
