@@ -3,6 +3,53 @@ import jax
 import jax.numpy as jnp
 from jax import jit, grad, vmap
 from functools import partial
+from jax import custom_vjp
+
+# --- Safe Eigenvalue Solver with Gradient Stabilization ---
+@custom_vjp
+def safe_eigh(A):
+    vals, vecs = jnp.linalg.eigh(A)
+    return vals, vecs
+
+def safe_eigh_fwd(A):
+    vals, vecs = jnp.linalg.eigh(A)
+    return (vals, vecs), (vals, vecs)
+
+def safe_eigh_bwd(res, g):
+    vals, vecs = res
+    g_vals, g_vecs = g
+    
+    # Gradient of eigenvalues
+    # dL/dA_vals = sum(g_val_i * v_i * v_i.T)
+    grad_A_vals = jnp.einsum('k,ik,jk->ij', g_vals, vecs, vecs)
+    
+    # Gradient of eigenvectors
+    # F_ij = 1 / (lambda_j - lambda_i) if i != j else 0
+    # Safe division: mask out diagonal and close values
+    diff = vals[:, None] - vals[None, :]
+    
+    # Create a mask for non-zero differences, and replace 0s with a large number
+    # so that 1/large_number becomes 0.
+    # This effectively sets F_ii = 0 and F_ij = 0 if vals_i == vals_j
+    F = jnp.where(jnp.abs(diff) < 1e-9, jnp.inf, 1.0 / diff)
+    F = jnp.where(jnp.isinf(F), 0.0, F) # Replace inf with 0
+    F = jnp.where(jnp.isnan(F), 0.0, F) # Replace nan with 0 (shouldn't happen with inf handling)
+    
+    vt_gv = vecs.T @ g_vecs
+    
+    # Contribution from eigenvector derivatives
+    P = F * vt_gv
+    
+    grad_A_vecs = vecs @ P @ vecs.T
+    
+    # Combine (for real symmetric A)
+    # The gradient must be symmetric
+    total_grad = grad_A_vals + grad_A_vecs
+    total_grad = 0.5 * (total_grad + total_grad.T)
+    
+    return (total_grad,)
+
+safe_eigh.defvjp(safe_eigh_fwd, safe_eigh_bwd)
 
 # Enable 64-bit precision for FEM accuracy
 jax.config.update("jax_enable_x64", True)
@@ -489,7 +536,8 @@ class PlateFEM:
         d2 = elem_nodes_xyz[:, 3, :] - elem_nodes_xyz[:, 1, :]
         
         normals = jnp.cross(d1, d2)
-        norms = jnp.linalg.norm(normals, axis=1, keepdims=True) + 1e-10
+        # Safe normalization: sqrt(sum(x^2) + eps)
+        norms = jnp.sqrt(jnp.sum(normals**2, axis=1, keepdims=True) + 1e-12)
         normals = normals / norms # (num_elems, 3)
         
         # Batch compute element matrices
@@ -510,7 +558,7 @@ class PlateFEM:
         # We assume constant nu = 0.3 for now
         nu = 0.3
         
-        def compute_elem(E, t, rho, normal):
+        def compute_elem(E, t, rho, normal, area_e):
              # 1. Bending & Membrane Stiffness (Local system)
             Kb, Mb = self._get_mindlin_K(E, t, nu, rho)
             Km, Mm = self._get_membrane_K(E, t, nu, rho)
@@ -519,7 +567,8 @@ class PlateFEM:
             K_local = jnp.zeros((24, 24))
             M_local = jnp.zeros((24, 24))
             
-            drill_coeff = E * t * area_elem * 1e-4
+            # Use passed area_e for drill coefficient
+            drill_coeff = E * t * area_e * 1e-4
             
             for i in range(4):
                 for j in range(4):
@@ -542,12 +591,12 @@ class PlateFEM:
         # Calculate Transformation Matrices outside
         # Local x': Vector from n1 to n2
         v12 = elem_nodes_xyz[:, 1, :] - elem_nodes_xyz[:, 0, :]
-        v12 = v12 / (jnp.linalg.norm(v12, axis=1, keepdims=True) + 1e-10)
+        v12 = v12 / jnp.sqrt(jnp.sum(v12**2, axis=1, keepdims=True) + 1e-12)
         
         # Local z': normals
         # Local y': cross(z', x')
         y_prime = jnp.cross(normals, v12)
-        y_prime = y_prime / (jnp.linalg.norm(y_prime, axis=1, keepdims=True) + 1e-10)
+        y_prime = y_prime / jnp.sqrt(jnp.sum(y_prime**2, axis=1, keepdims=True) + 1e-12)
         
         # Recompute x' to be truly orthogonal: cross(y', z')
         x_prime = jnp.cross(y_prime, normals)
@@ -574,8 +623,8 @@ class PlateFEM:
         Ts = jnp.stack([x_prime, y_prime, normals], axis=2) # (num_elems, 3, 3)
         
         # Define assembly function with transformation
-        def compute_rotated_elem(E, t, rho, T_3x3):
-            Kl, Ml = compute_elem(E, t, rho, None) # Normal passed? No need if we rely on T
+        def compute_rotated_elem(E, t, rho, T_3x3, area_e):
+            Kl, Ml = compute_elem(E, t, rho, None, area_e) # Normal passed? No need if we rely on T
             
             # Expand T_3x3 to 24x24
             # T_node = | T  0 |
@@ -602,7 +651,8 @@ class PlateFEM:
 
         # K_elems, M_elems shape: (num_elements, 24, 24)
         area_elem = self.dx * self.dy # Constant for regular grid
-        K_elems, M_elems = vmap(compute_rotated_elem)(E_elems, t_elems, rho_elems, Ts)
+        areas_batch = jnp.full(E_elems.shape[0], area_elem)
+        K_elems, M_elems = vmap(compute_rotated_elem)(E_elems, t_elems, rho_elems, Ts, areas_batch)
         
         # To assemble, we can use strictly sparse format or dense if small.
         # JAX BCOO or CSR is available, or we can just define the matvec product directly 
@@ -695,7 +745,7 @@ class PlateFEM:
         
         return u
 
-    def solve_eigen(self, K_ff, M_ff, num_modes=5):
+    def solve_eigen(self, K, M, num_modes=10):
         # General eigenvalue problem: K u = lam M u
         # JAX eigh implementation might not support 'b' argument fully.
         # Workaround: Using Lumped Mass M_ff (diagonal).
@@ -707,16 +757,22 @@ class PlateFEM:
         # Let's extract diagonal for safety and efficiency.
         
         # Stability: Small epsilon on diagonal
-        m_diag = jnp.diag(M_ff)
+        m_diag = jnp.diag(M)
         m_diag = jnp.maximum(m_diag, 1e-15)
         m_inv_sqrt = 1.0 / jnp.sqrt(m_diag)
         
         # Symmetrize K for safety
-        K_stable = (K_ff + K_ff.T) / 2.0
+        K_stable = (K + K.T) / 2.0
         A = K_stable * m_inv_sqrt[:, None] * m_inv_sqrt[None, :]
         
+        # --- STABILITY IMPROVEMENT: Break Repeated Eigenvalues ---
+        # Repeated eigenvalues (especially 6 rigid body modes at ~0) cause NaN gradients in eigh.
+        # We use a log-spaced perturbation to ensure even tiny differences are distinct enough for JAX.
+        eps_unique = jnp.logspace(-9, -4, A.shape[0])
+        A = A + jnp.diag(eps_unique)
+        
         # Standard Eigensolver
-        vals, vecs_v = jnp.linalg.eigh(A) # Standard eigh is more robust than scipy here
+        vals, vecs_v = safe_eigh(A) # Changed from jnp.linalg.eigh to safe_eigh
         
         # Recover u = M^(-1/2) v
         vecs_u = vecs_v * m_inv_sqrt[:, None]
@@ -908,9 +964,9 @@ class PlateFEM:
         tau_xy = 6.0 * M_xy / (t**2)
         
         # von Mises stress: sqrt(σ_xx² + σ_yy² - σ_xx*σ_yy + 3*τ_xy²)
-        sigma_vm = jnp.sqrt(
-            sigma_xx**2 + sigma_yy**2 - sigma_xx * sigma_yy + 3.0 * tau_xy**2
-        )
+        # Added protection against sqrt(0) which causes NaN gradients
+        vm_squared = sigma_xx**2 + sigma_yy**2 - sigma_xx * sigma_yy + 3.0 * tau_xy**2
+        sigma_vm = jnp.sqrt(jnp.maximum(vm_squared, 1e-10))
         
         return sigma_vm  # shape: (num_nodes,)
 
@@ -940,10 +996,9 @@ class PlateFEM:
         gamma_xy = z_max * kappa_xy  # shear strain
         
         # von Mises equivalent strain
-        # Using same formula as stress (for small strain)
-        eps_vm = jnp.sqrt(
-            eps_xx**2 + eps_yy**2 - eps_xx * eps_yy + 3.0 * gamma_xy**2
-        )
+        # Added protection against sqrt(0) which causes NaN gradients
+        vm_squared = eps_xx**2 + eps_yy**2 - eps_xx * eps_yy + 3.0 * gamma_xy**2
+        eps_vm = jnp.sqrt(jnp.maximum(vm_squared, 1e-12))
         
         return eps_vm  # shape: (num_nodes,)
 
