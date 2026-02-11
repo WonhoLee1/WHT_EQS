@@ -8,11 +8,13 @@ import numpy as np
 from scipy.interpolate import griddata
 import matplotlib.pyplot as plt
 import os
+import msvcrt
+import datetime
 
 # Import our modular components
 from solver import PlateFEM
 from WHT_EQS_pattern_generator import get_thickness_field, get_z_field
-from WHT_EQS_load_cases import TwistCase, PureBendingCase, CornerLiftCase
+from WHT_EQS_load_cases import TwistCase, PureBendingCase, CornerLiftCase, TwoCornerLiftCase
 from WHT_EQS_visualization import (
     stage1_visualize_patterns,
     stage2_visualize_ground_truth,
@@ -37,7 +39,10 @@ class EquivalentSheetModel:
     def add_case(self, case):
         self.cases.append(case)
 
-    def generate_targets(self, resolution_high=(50, 20), num_modes_save=5, target_config=None):
+    def generate_targets(self, resolution_high=(50, 20), 
+                        num_modes_save=5, 
+                        target_config=None
+                        ):
         print("\n" + "="*70)
         print(" [STAGE 1] TARGET GENERATION & PATTERN VERIFICATION")
         print("="*70)
@@ -54,13 +59,13 @@ class EquivalentSheetModel:
         # 2. Build High-fidelity Property Fields
         t_h = get_thickness_field(
             Xh, Yh, Lx=self.fem.Lx, Ly=self.fem.Ly, 
-            pattern_str=target_config.get('pattern', 'ABC'),
+            pattern_str=target_config.get('pattern', '   '),
             base_t=target_config.get('base_t', 1.0),
-            bead_t=target_config.get('bead_t', 2.0)
+            bead_t=target_config.get('bead_t', 1.0)
         )
         z_h = get_z_field(
             Xh, Yh, Lx=self.fem.Lx, Ly=self.fem.Ly, 
-            pattern_pz=target_config.get('pattern_pz', 'TNY'),
+            pattern_pz=target_config.get('pattern_pz', '   '),
             pz_dict=target_config.get('bead_pz', {})
         )
         rho_h = jnp.full_like(Xh, target_config.get('base_rho', 7.85e-9))
@@ -87,9 +92,7 @@ class EquivalentSheetModel:
             free_dofs = jnp.setdiff1d(jnp.arange(fem_high.total_dof), fixed_dofs)
             u = fem_high.solve_static_partitioned(K_h, F, free_dofs, fixed_dofs, fixed_vals)
             
-            # Compute Full Reaction Forces (R = K*u - F_ext)
-            # F_int represents internal nodal forces. At free nodes F_int = F_ext.
-            # At fixed nodes, F_int = F_ext + R. So R = F_int - F_ext.
+            # Compute Full Reaction Forces
             F_int = K_h @ u
             R_residual = F_int - F
             
@@ -107,13 +110,56 @@ class EquivalentSheetModel:
                 'force_vector': np.array(F)         # Store Loads for visualization
             })
             
+        # --- NEW: Generate Summary Ground Truth Plot ---
+        print("Generating Ground Truth Summary Plot (3xN)...")
+        n_cases = len(self.cases)
+        plt.rcParams.update({'font.size': 8})
+        fig, axes = plt.subplots(3, n_cases, figsize=(4*n_cases, 10), squeeze=False)
+        fig.suptitle(f"Ground Truth Analysis Summary (Resolution: {Nx_h}x{Ny_h})\nRows: Disp, Stress, Strain | Colormap: jet", fontsize=10)
+        
+        xh, yh = np.linspace(0, self.fem.Lx, Nx_h+1), np.linspace(0, self.fem.Ly, Ny_h+1)
+        
+        for i, target in enumerate(self.targets):
+            # Row 0: Displacement
+            data_w = target['u_static'].reshape(Nx_h+1, Ny_h+1)
+            im0 = axes[0, i].contourf(xh, yh, data_w.T, 30, cmap='jet')
+            axes[0, i].set_title(f"Case: {target['case_name']}\nMax Disp: {np.max(np.abs(data_w)):.3f}mm", fontsize=8)
+            axes[0, i].set_aspect('equal')
+            plt.colorbar(im0, ax=axes[0, i], shrink=0.7)
+            
+            # Row 1: Max Surface Stress
+            data_s = target['max_surface_stress'].reshape(Nx_h+1, Ny_h+1)
+            im1 = axes[1, i].contourf(xh, yh, data_s.T, 30, cmap='jet')
+            axes[1, i].set_title(f"Max Stress: {np.max(data_s):.2f} MPa", fontsize=8)
+            axes[1, i].set_aspect('equal')
+            plt.colorbar(im1, ax=axes[1, i], shrink=0.7)
+            
+            # Row 2: Max Surface Strain
+            data_e = target['max_surface_strain'].reshape(Nx_h+1, Ny_h+1) * 1000 # to microstrain/e-3
+            im2 = axes[2, i].contourf(xh, yh, data_e.T, 30, cmap='jet')
+            axes[2, i].set_title(f"Max Strain: {np.max(data_e):.3f} e-3", fontsize=8)
+            axes[2, i].set_aspect('equal')
+            plt.colorbar(im2, ax=axes[2, i], shrink=0.7)
+            
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.savefig("ground_truth_3d_loadcases.png", dpi=150)
+        plt.close()
+        print(" -> Saved: ground_truth_3d_loadcases.png")
+        
+        # 4. Solve Eigenmodes
         print("Solving Target Eigenmodes...")
         vals, vecs = fem_high.solve_eigen(K_h, M_h, num_modes=num_modes_save + 10)
         
-        # Dynamically find the first elastic mode (> 0.01 Hz)
+        # Smart Elastic Mode Detection (Log-Gap Method)
+        # Using logarithmic jump detection to robustly find the first true elastic mode.
         all_freqs_h = np.sqrt(np.maximum(np.array(vals), 0.0)) / (2 * np.pi)
-        valid_indices = np.where(all_freqs_h > 0.01)[0]
-        start_idx = valid_indices[0] if len(valid_indices) > 0 else 6
+        log_f = np.log(np.maximum(all_freqs_h[:15], 1e-6))
+        gaps = np.concatenate([[0], log_f[1:] - log_f[:-1]])
+        
+        # A mode is elastic if it's > 1Hz and follows a major jump, or if it's clearly high freq (>20Hz)
+        is_elastic = (all_freqs_h > 1.0) & (gaps > 1.0) | (all_freqs_h > 20.0)
+        start_idx = np.argmax(is_elastic) if np.any(is_elastic) else (6 if len(all_freqs_h) > 6 else 0)
+        
         print(f" -> Found first elastic mode at index {start_idx} ({all_freqs_h[start_idx]:.2f} Hz)")
 
         self.target_eigen = {
@@ -137,13 +183,15 @@ class EquivalentSheetModel:
                  mass_tolerance=0.05,
                  max_iterations=300, 
                  use_early_stopping=True, 
-                 early_stop_patience=30, 
+                 early_stop_patience=100, 
                  early_stop_tol=1e-8,
                  learning_rate=0.01,
-                 num_modes_loss=None):
+                 num_modes_loss=None,
+                 min_bead_width=10.0):
                  
         print("\n" + "="*70)
         print(" [STAGE 3] ADVANCED OPTIMIZATION (EXPLICIT LOGIC)")
+        print(f" -> Setting: Min Bead Width = {min_bead_width} mm")
         print("="*70)
         
         Nx_l, Ny_l = self.fem.nx, self.fem.ny
@@ -160,8 +208,6 @@ class EquivalentSheetModel:
             u_l = griddata(pts_h, tgt['u_static'], pts_l, method='cubic')
             stress_l = griddata(pts_h, tgt['max_surface_stress'], pts_l, method='cubic')
             strain_l = griddata(pts_h, tgt['max_surface_strain'], pts_l, method='cubic')
-            
-            # Interpolate Strain Energy Density
             sed_l = griddata(pts_h, tgt['strain_energy_density'], pts_l, method='cubic')
             
             self.targets_low.append({
@@ -172,255 +218,217 @@ class EquivalentSheetModel:
                 'weight': tgt.get('weight', 1.0)
             })
             
-        # Modal Targets Interpolation
         n_loss = num_modes_loss if num_modes_loss is not None else 5
         t_vals = self.target_eigen['vals'][:n_loss]
-             
-        t_modes_l = [griddata(pts_h, self.target_eigen['modes'][:, i], pts_l, method='cubic') 
-                     for i in range(len(t_vals))]
+        t_modes_l = [griddata(pts_h, self.target_eigen['modes'][:, i], pts_l, method='cubic') for i in range(len(t_vals))]
         t_modes_l = jnp.stack(t_modes_l, axis=1)
 
         # 2. Optimization Parameters Setup
-        print(f"Starting Optimization (Modes for Loss: {n_loss})...")
-        
-        # --- IMPROVED: Selective Optimization with Parameter Scaling ---
-        # Scaling maps physical values to ~1.0 for balanced gradients
-        self.scaling = {
-            't': opt_config['t'].get('init', 1.0),
-            'rho': opt_config['rho'].get('init', 7.85e-9),
-            'E': opt_config['E'].get('init', 210000.0),
-            'pz': 1.0 # pz usually centered around 0, keep as is or shift
-        }
+        self.scaling = {}
+        for k in ['t', 'rho', 'E', 'pz']:
+            cfg = opt_config.get(k, {})
+            val = cfg.get('init', 0.0); self.scaling[k] = val if abs(val) > 1e-15 else 1.0
         
         full_params_scaled = {}
-        for key_name in ['t', 'rho', 'E', 'pz']:
-            if key_name in opt_config:
-                init_phys = opt_config[key_name].get('init', 1.0 if key_name == 't' else 0.0)
-                # Scale: phys = scaled * scale_factor => scaled = phys / scale_factor
-                scale_factor = self.scaling.get(key_name, 1.0)
-                full_params_scaled[key_name] = jnp.full((Nx_l+1, Ny_l+1), init_phys / scale_factor)
+        for k in ['t', 'rho', 'E', 'pz']:
+            if k in opt_config:
+                init_phys = opt_config[k].get('init', 1.0 if k == 't' else 0.0)
+                full_params_scaled[k] = jnp.full((Nx_l+1, Ny_l+1), init_phys / self.scaling[k])
         
-        # Initialize with small jitter to break symmetry
-        key = jax.random.PRNGKey(42)
-        full_params_scaled['t'] = full_params_scaled['t'] + 1e-4 * jax.random.uniform(key, full_params_scaled['t'].shape)
+        key = jax.random.PRNGKey(42); key, k1, k2 = jax.random.split(key, 3)
+        # ONLY add jitter to parameters that are actually being optimized
+        if 't' in full_params_scaled and opt_config.get('t', {}).get('opt', False): 
+            full_params_scaled['t'] += 1e-4 * jax.random.uniform(k1, full_params_scaled['t'].shape)
+        if 'pz' in full_params_scaled and opt_config.get('pz', {}).get('opt', False):
+            full_params_scaled['pz'] += 1e-4 * jax.random.uniform(k2, full_params_scaled['pz'].shape)
 
-        # Split into optimized (trainable) and fixed parameters
-        params = {}
-        fixed_params_scaled = {}
-        for k, v in full_params_scaled.items():
-            if opt_config.get(k, {}).get('opt', True):
-                params[k] = v
-            else:
-                fixed_params_scaled[k] = v
+        params = {k: v for k, v in full_params_scaled.items() if opt_config.get(k, {}).get('opt', True)}
+        fixed_params_scaled = {k: v for k, v in full_params_scaled.items() if not opt_config.get(k, {}).get('opt', True)}
         
-        print(f" -> Optimized variables (Scaled): {list(params.keys())}")
-        print(f" -> Fixed variables (Scaled): {list(fixed_params_scaled.keys())}")
-
-        # Use a more robust optimizer chain
-        optimizer = optax.chain(
-            optax.clip_by_global_norm(1.0),
-            optax.adam(learning_rate=0.005)
+        # Re-applying robust auto-rate scheduling (Warmup + Cosine Decay)
+        warmup_steps = max(5, max_iterations // 20)
+        lr_schedule = optax.warmup_cosine_decay_schedule(
+            init_value=learning_rate / 5.0,  # Start at 20% of peak for immediate progress
+            peak_value=learning_rate,        # User-defined max LR
+            warmup_steps=warmup_steps,
+            decay_steps=max_iterations,
+            end_value=learning_rate * 0.01   # Final fine-tuning phase
         )
+
+        # --- Pre-compute Topography Filter Kernel ---
+        filter_kernel = None
+        if min_bead_width > 0:
+            dx_l, dy_l = self.fem.Lx/Nx_l, self.fem.Ly/Ny_l
+            rx, ry = int(np.ceil(min_bead_width / (2*dx_l))), int(np.ceil(min_bead_width / (2*dy_l)))
+            kx, ky = np.linspace(-rx, rx, 2*rx+1), np.linspace(-ry, ry, 2*ry+1)
+            KX, KY = np.meshgrid(kx, ky, indexing='ij')
+            dist = np.sqrt((KX*dx_l)**2 + (KY*dy_l)**2)
+            kernel = np.maximum(0, (min_bead_width/2.0) - dist)
+            filter_kernel = jnp.array(kernel / np.sum(kernel))
+
+        optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate=lr_schedule))
         opt_state = optimizer.init(params)
 
-        # Pre-compute BCs to avoid jnp.where inside JIT
         case_bcs = []
         for case in self.cases:
             fd, fv, F = case.get_bcs(self.fem)
-            free = jnp.setdiff1d(jnp.arange(self.fem.total_dof), fd)
-            case_bcs.append({'fd': fd, 'fv': fv, 'F': F, 'free': free})
+            case_bcs.append({'fd': fd, 'fv': fv, 'F': F, 'free': jnp.setdiff1d(jnp.arange(self.fem.total_dof), fd)})
 
         @jax.jit
         def loss_fn(p_scaled, fixed_p_scaled, scales):
-            # 1. Unscale to physical units
-            combined_phys = {}
-            for k, v in p_scaled.items():
-                combined_phys[k] = v * scales[k]
-            for k, v in fixed_p_scaled.items():
-                combined_phys[k] = v * scales[k]
+            combined_phys = {k: v * scales[k] for k, v in p_scaled.items()}
+            for k, v in fixed_p_scaled.items(): combined_phys[k] = v * scales[k]
             
-            # 2. Map 'pz' to 'z' for the FEM solver
             if 'pz' in combined_phys:
-                combined_phys['z'] = combined_phys['pz']
+                if filter_kernel is not None:
+                    combined_phys['z'] = jax.scipy.signal.convolve2d(combined_phys['pz'], filter_kernel, mode='same')
+                else:
+                    combined_phys['z'] = combined_phys['pz']
             
-            K, M = self.fem.assemble(combined_phys)
-            p_actual = combined_phys
+            K, M = self.fem.assemble(combined_phys); p_actual = combined_phys
+            l_static, l_stress, l_strain, l_energy, l_freq, l_mode, l_mass, l_reg = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
             
-            # Initialize Loss Components
-            l_static = 0.0
-            l_stress = 0.0
-            l_strain = 0.0
-            l_energy = 0.0
-            l_freq = 0.0
-            l_mode = 0.0
-            l_mass = 0.0
-            l_reg = 0.0
-            
-            # --- 1. Static Responses Loss ---
             for i, case in enumerate(self.cases):
-                fd = case_bcs[i]['fd']
-                fv = case_bcs[i]['fv']
-                F  = case_bcs[i]['F']
-                free = case_bcs[i]['free']
+                b = case_bcs[i]
+                u = self.fem.solve_static_partitioned(K, b['F'], b['free'], b['fd'], b['fv'])
+                w = u[2::6]
                 
-                u = self.fem.solve_static_partitioned(K, F, free, fd, fv)
-                w = u[2::6] # Vertical displacement
+                # Displacement: Normalized by target mean
+                delta, scale = w - self.targets_low[i]['u_static'], jnp.mean(jnp.abs(self.targets_low[i]['u_static'])) + 1e-6
+                l_static += jnp.mean((delta / scale)**2) * self.targets_low[i]['weight']
                 
-                # Displacement matching (RMSE)
-                if loss_weights.get('static', 0.0) > 0:
-                    delta = w - self.targets_low[i]['u_static']
-                    scale = jnp.mean(jnp.abs(self.targets_low[i]['u_static'])) + 1e-6
-                    l_static += jnp.mean((delta / scale)**2) * self.targets_low[i]['weight']
-                
-                # Surface Stress matching
-                if use_surface_stress and loss_weights.get('surface_stress', 0.0) > 0:
-                    curr_stress = self.fem.compute_max_surface_stress(u, p_actual)
-                    delta = curr_stress - self.targets_low[i]['max_stress']
-                    scale = jnp.mean(jnp.abs(self.targets_low[i]['max_stress'])) + 1e-6
+                if use_surface_stress:
+                    delta, scale = self.fem.compute_max_surface_stress(u, p_actual) - self.targets_low[i]['max_stress'], jnp.mean(jnp.abs(self.targets_low[i]['max_stress'])) + 1e-6
                     l_stress += jnp.mean((delta / scale)**2)
-                    
-                # Surface Strain matching
-                if use_surface_strain and loss_weights.get('surface_strain', 0.0) > 0:
-                    curr_strain = self.fem.compute_max_surface_strain(u, p_actual)
-                    delta = curr_strain - self.targets_low[i]['max_strain']
-                    scale = jnp.mean(jnp.abs(self.targets_low[i]['max_strain'])) + 1e-6
+                if use_surface_strain:
+                    delta, scale = self.fem.compute_max_surface_strain(u, p_actual) - self.targets_low[i]['max_strain'], jnp.mean(jnp.abs(self.targets_low[i]['max_strain'])) + 1e-6
                     l_strain += jnp.mean((delta / scale)**2)
-                
-                # Strain Energy matching
-                if use_strain_energy and loss_weights.get('strain_energy', 0.0) > 0:
-                    curr_energy = self.fem.compute_strain_energy_density(u, p_actual)
-                    if 'strain_energy_density' in self.targets_low[i]:
-                         tgt_e = self.targets_low[i]['strain_energy_density']
-                         scale = jnp.mean(jnp.abs(tgt_e)) + 1e-6
-                         l_energy += jnp.mean(((curr_energy - tgt_e)/scale)**2)
-                    else:
-                         pass # Skip if no target
+                if use_strain_energy:
+                    delta, scale = self.fem.compute_strain_energy_density(u, p_actual) - self.targets_low[i]['strain_energy_density'], jnp.mean(jnp.abs(self.targets_low[i]['strain_energy_density'])) + 1e-6
+                    l_energy += jnp.mean((delta / scale)**2)
 
-            # Normalize Static Losses by number of cases
             n_cases = len(self.cases)
-            l_static /= n_cases
-            l_stress /= n_cases
-            l_strain /= n_cases
-            l_energy /= n_cases
+            l_static /= n_cases; l_stress /= n_cases; l_strain /= n_cases; l_energy /= n_cases
 
-            # --- 2. Modal Responses Loss ---
-            if (loss_weights.get('freq', 0.0) > 0 or loss_weights.get('mode', 0.0) > 0 or True):
-                # Solve global eigenvalue problem
-                vals, vecs = self.fem.solve_eigen(K, M, num_modes=len(t_vals)+10)
-                
-                # Eigenfrequency matching (Filter for > 0.01 Hz)
-                all_freqs_curr = jnp.sqrt(jnp.maximum(vals, 0.0)) / (2 * jnp.pi)
-                elastic_mask = (all_freqs_curr > 0.01)
-                start_idx_l = jnp.argmax(elastic_mask) # First True index (e.g. index 7)
-                
-                if loss_weights.get('freq', 0.0) > 0:
-                    curr_vals = jax.lax.dynamic_slice_in_dim(vals, start_idx_l, len(t_vals))
-                    curr_vals = jnp.abs(curr_vals)
-                    l_freq = jnp.mean((jnp.log(curr_vals + 1e-4) - jnp.log(t_vals + 1e-4))**2)
-                    l_freq = jnp.nan_to_num(l_freq, nan=0.0)
-                
-                # Mode Shape matching (MAC)
-                l_mode = 0.0
-                modes_w = jax.lax.dynamic_slice_in_dim(vecs[2::6, :], start_idx_l, len(t_vals), axis=1)
-                for j in range(len(t_vals)):
-                    num_i = jnp.sum(modes_w[:, j] * t_modes_l[:, j])**2
-                    den_i = (jnp.sum(modes_w[:, j]**2) + 1e-10) * (jnp.sum(t_modes_l[:, j]**2) + 1e-10)
-                    mac = num_i / den_i
-                    l_mode += (1.0 - mac)
-                l_mode = jnp.nan_to_num(l_mode / len(t_vals), nan=0.0)
-
-                # Track first frequency > 0.01 Hz for monitoring
-                f1_hz = jnp.where(jnp.any(elastic_mask), all_freqs_curr[start_idx_l], 0.0)
-
-            # --- 3. Geometric Constraints & Regularization ---
-            # Mass Constraint
-            if use_mass_constraint and loss_weights.get('mass', 0.0) > 0:
-                dx_l, dy_l = self.fem.Lx/Nx_l, self.fem.Ly/Ny_l
-                curr_mass = jnp.sum(p_actual['t'] * p_actual['rho']) * dx_l * dy_l
-                mass_err = (curr_mass - self.target_mass) / self.target_mass
-                l_mass = jnp.abs(mass_err) # Linear penalty for robustness
-
-            # Smoothness (TV Penalty)
-            if use_smoothing or loss_weights.get('reg', 0.0) > 0:
-                l_reg = 0.0
-                if 't' in p_scaled:
-                    l_reg += (jnp.mean(jnp.diff(p_scaled['t'], axis=0)**2) + jnp.mean(jnp.diff(p_scaled['t'], axis=1)**2))
-                if 'pz' in p_scaled:
-                    l_reg += 5.0 * (jnp.mean(jnp.diff(p_scaled['pz'], axis=0)**2) + jnp.mean(jnp.diff(p_scaled['pz'], axis=1)**2))
-
-            # Weighted Sum
-            total_loss = (
-                l_static * loss_weights.get('static', 0.0) +
-                l_stress * loss_weights.get('surface_stress', 0.0) +
-                l_strain * loss_weights.get('surface_strain', 0.0) + 
-                l_energy * loss_weights.get('strain_energy', 0.0) +
-                l_freq   * loss_weights.get('freq', 0.0) +
-                l_mode   * loss_weights.get('mode', 0.0) + 
-                l_mass   * loss_weights.get('mass', 0.0) +
-                l_reg    * loss_weights.get('reg', 0.0)
-            )
-            # Final NaN Guard
-            total_loss = jnp.nan_to_num(total_loss, nan=1e10)
+            vals, vecs = self.fem.solve_eigen(K, M, num_modes=len(t_vals)+10)
+            freqs = jnp.sqrt(jnp.maximum(vals, 0.0)) / (2 * jnp.pi)
             
-            metrics = {
-                'Total': total_loss,
-                'Disp': l_static,     # Renamed from Static for clarity
-                'Start': l_stress,    # Renamed/shortened from Stress
-                'Strn': l_strain,     # Renamed/shortened from Strain
-                'Engy': l_energy,     # Renamed/shortened from Energy
-                'Freq': l_freq,
-                'Mode': l_mode,
-                'Mass': l_mass,
-                'Reg': l_reg,
-                'f1_hz': f1_hz
-            }
-            return total_loss, metrics
+            # Smart Elastic Mode Detection (Log-Gap Method)
+            # Find the largest relative jump between consecutive modes in the RBM range
+            log_f = jnp.log(jnp.maximum(freqs[:15], 1e-6))
+            gaps = jnp.concatenate([jnp.zeros(1), log_f[1:] - log_f[:-1]])
+            idx = jnp.argmax((freqs > 1.0) & (gaps > 1.0) | (freqs > 20.0))
+            
+            # Frequency matching: Simple relative error (Linear scale) for better sensitivity
+            curr_vals = jax.lax.dynamic_slice_in_dim(vals, idx, len(t_vals))
+            l_freq = jnp.mean((curr_vals / (t_vals + 1e-6) - 1.0)**2)
+            
+            modes_w = jax.lax.dynamic_slice_in_dim(vecs[2::6, :], idx, len(t_vals), axis=1)
+            l_mode = jnp.mean(1.0 - jnp.sum(modes_w * t_modes_l, axis=0)**2 / (jnp.sum(modes_w**2, axis=0)*jnp.sum(t_modes_l**2, axis=0) + 1e-10))
+            f1_hz = freqs[idx]
 
-        # 3. Optimization Loop with Early Stopping
-        best_loss = float('inf')
-        wait = 0
+            l_mass = jnp.abs((jnp.sum(p_actual['t'] * p_actual['rho']) * (self.fem.Lx/Nx_l)*(self.fem.Ly/Ny_l) - self.target_mass) / self.target_mass) if use_mass_constraint else 0.0
+            for k in ['t', 'pz']:
+                if k in p_scaled: l_reg += (jnp.mean(jnp.diff(p_scaled[k], axis=0)**2) + jnp.mean(jnp.diff(p_scaled[k], axis=1)**2))
+
+            total_loss = (l_static * loss_weights.get('static', 0.0) +
+                          l_stress * loss_weights.get('surface_stress', 0.0) +
+                          l_strain * loss_weights.get('surface_strain', 0.0) + 
+                          l_energy * loss_weights.get('strain_energy', 0.0) +
+                          l_freq   * loss_weights.get('freq', 0.0) +
+                          l_mode   * loss_weights.get('mode', 0.0) + 
+                          l_mass   * loss_weights.get('mass', 0.0) +
+                          l_reg    * loss_weights.get('reg', 0.0))
+                          
+            return total_loss, {'Total': total_loss, 'Disp': l_static, 'Start': l_stress, 'Strn': l_strain, 'Engy': l_energy, 'Freq': l_freq, 'Mode': l_mode, 'Mass': l_mass, 'Reg': l_reg, 'f1_hz': f1_hz}
+
+        # Clear initial metrics logic
+        print("Optimization Engine Ready. Initializing search...")
+
+        best_loss, wait = float('inf'), 0
+        best_params = params
+        best_iter = 0
+        self.history = [] # To store optimization trajectory
         
-        print(f"{'Iter':<5} | {'Total':<10} | {'Disp':<9} | {'Strs':<9} | {'Strn':<9} | {'Engy':<9} | {'Freq':<9} | {'Mode':<9} | {'Freq1':<6} | {'G-Norm':<9}")
-        print("-" * 115)
+        print("\n [Tip] Press 'q' to stop optimization and use the best result found so far.\n")
+        print(f"{'Iter':<5} | {'Total_Norm':<10} | {'Disp':<9} | {'Strs':<9} | {'Strn':<9} | {'Engy':<9} | {'Freq':<9} | {'Mode':<9} | {'Freq1':<6}")
+        print("-" * 105)
 
         for i in range(max_iterations):
-            # Standard Optimization Step
             (val, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, fixed_params_scaled, self.scaling)
             
-            # Global Safe-Guard: Filter NaNs/Infs from gradients
-            grads = jax.tree_util.tree_map(lambda g: jnp.where(jnp.isfinite(g), g, 0.0), grads)
-                
-            updates, opt_state = optimizer.update(grads, opt_state)
+            # Store history (on CPU as regular floats)
+            self.history.append({k: float(v) for k, v in metrics.items()})
+            
+            updates, opt_state = optimizer.update(jax.tree_util.tree_map(lambda g: jnp.where(jnp.isfinite(g), g, 0.0), grads), opt_state)
             params = optax.apply_updates(params, updates)
             
-            # Explicit Param Clipping for Scaled Variables
-            for k in params.keys():
-                s_factor = self.scaling[k]
-                params[k] = jnp.clip(params[k], opt_config[k]['min']/s_factor, opt_config[k]['max']/s_factor)
-            
-            # Combine and Unscale for report/save
-            self.optimized_params = {}
-            for k, v in params.items(): self.optimized_params[k] = v * self.scaling[k]
-            for k, v in fixed_params_scaled.items(): self.optimized_params[k] = v * self.scaling[k]
-            
-            if i % 10 == 0:
-                 gnorm = jnp.sqrt(sum(jnp.sum(g**2) for g in jax.tree_util.tree_leaves(grads)))
-                 print(f"{i:<5d} | {val:<10.4e} | {metrics['Disp']:<9.2e} | {metrics['Start']:<9.2e} | {metrics['Strn']:<9.2e} | {metrics['Engy']:<9.2e} | {metrics['Freq']:<9.2e} | {metrics['Mode']:<9.2e} | {metrics['f1_hz']:<6.2f} | {gnorm:<9.2e}")
+            # Parameter Clipping (Safety)
+            for k in params:
+                cfg = opt_config[k]
+                params[k] = jnp.clip(params[k], cfg['min']/self.scaling[k], cfg['max']/self.scaling[k])
 
-            # Early Stopping Logic (Explicit)
-            if use_early_stopping:
-                if val < best_loss - early_stop_tol:
-                    best_loss = val
-                    wait = 0
-                    # self.optimized_params already updated at lines 383-385
-                else:
-                    wait += 1
-                    if wait >= (early_stop_patience or 30):
-                        print(f"✔ Early stopping triggered at iteration {i}. Convergence reached.")
-                        break
-            # Final physical params are already in self.optimized_params from lines 383-385
+            # Check for 'q' key press to stop early
+            if msvcrt.kbhit():
+                char = msvcrt.getch()
+                if char in [b'q', b'Q']:
+                    print(f"\n [USER INTERRUPT] 'q' pressed. Terminating and reverting to best params (Iter {best_iter})...")
+                    params = best_params
+                    break
 
+            if val < best_loss - early_stop_tol:
+                best_loss, wait = val, 0
+                best_params = params
+                best_iter = i
+            else:
+                wait += 1
+                if use_early_stopping and wait >= (early_stop_patience or 30):
+                    print(f"\n [EARLY STOP] No improvement for {wait} iters. Reverting to best params (Iter {best_iter})...")
+                    params = best_params
+                    break
+
+            if i % 10 == 0: print(f"{i:<5d} | {val:<10.3f} | {metrics['Disp']:<9.2e} | {metrics['Start']:<9.2e} | {metrics['Strn']:<9.2e} | {metrics['Engy']:<9.2e} | {metrics['Freq']:<9.2e} | {metrics['Mode']:<9.2e} | {metrics['f1_hz']:<6.2f}")
+
+        # Final Assignment
+        params = best_params
+        self.optimized_params = {**{k: v * self.scaling[k] for k, v in params.items()}, **{k: v * self.scaling[k] for k, v in fixed_params_scaled.items()}}
+        print(f"\n -> Optimization Finished. Best Result found at Iteration {best_iter} with Loss: {best_loss:.6f}")
+        
+        # Generate convergence plot automatically
+        self.plot_optimization_history()
+        
         return self.optimized_params
+
+    def plot_optimization_history(self):
+        """Generates a line plot of the optimization convergence history."""
+        if not hasattr(self, 'history') or len(self.history) == 0:
+            print(" -> No history data to plot.")
+            return
+
+        print("Generating Convergence History Plot...")
+        iters = np.arange(len(self.history))
+        keys = [k for k in self.history[0].keys() if k != 'f1_hz']
+        
+        plt.figure(figsize=(10, 6))
+        plt.rcParams.update({'font.size': 8})
+        
+        for k in keys:
+            vals = np.array([h[k] for h in self.history])
+            init_val = vals[0] if abs(vals[0]) > 1e-12 else 1.0
+            relative_vals = vals / init_val
+            plt.plot(iters, relative_vals, label=f"{k} (Rel.)", linewidth=1.5)
+
+        plt.xlabel("Iteration", fontsize=9)
+        plt.ylabel("Value Relative to Initial (v/v0)", fontsize=9)
+        plt.title("Optimization Convergence History", fontsize=10)
+        plt.yscale('log') # Log scale is often better for convergence
+        plt.grid(True, which="both", ls="-", alpha=0.2)
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+        plt.tight_layout()
+        
+        plt.savefig("verify_3d_opt_history.png", dpi=150, bbox_inches='tight')
+        plt.close()
+        print(" -> Saved: verify_3d_opt_history.png")
 
     def verify(self):
         print("\n" + "="*70)
@@ -533,31 +541,42 @@ class EquivalentSheetModel:
 
         # 4. Parameter Comparison Plot
         print("Generating Parameter comparison plots...")
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        plt.rcParams.update({'font.size': 8})
+        fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+        
         t_ref = self.target_params_high['t'].reshape(Nx_h+1, Ny_h+1)
+        z_ref = self.target_params_high['z'].reshape(Nx_h+1, Ny_h+1)
         t_opt = opt_params_h['t'].reshape(Nx_h+1, Ny_h+1)
+        z_opt = opt_params_h['z'].reshape(Nx_h+1, Ny_h+1)
         
-        im0 = axes[0,0].contourf(xh, yh, t_ref.T, 30, cmap='viridis')
-        axes[0,0].set_title("Target Hard-coded Thickness (mm)")
-        plt.colorbar(im0, ax=axes[0,0])
+        # Calculate comparison metrics
+        t_rmse = np.sqrt(np.mean((t_ref - t_opt)**2))
+        t_corr = np.corrcoef(t_ref.flatten(), t_opt.flatten())[0,1]
+        z_rmse = np.sqrt(np.mean((z_ref - z_opt)**2))
+        z_corr = np.corrcoef(z_ref.flatten(), z_opt.flatten())[0,1]
         
-        im1 = axes[0,1].contourf(xh, yh, t_opt.T, 30, cmap='viridis')
-        axes[0,1].set_title("Optimized Equivalent Thickness (mm)")
-        plt.colorbar(im1, ax=axes[0,1])
+        fig.suptitle(f"Geometric Parameter Verification (Resolution: {Nx_h}x{Ny_h})\n"
+                     f"Thickness: RMSE={t_rmse:.4f}, Corr={t_corr:.4f} | Topography: RMSE={z_rmse:.4f}, Corr={z_corr:.4f}", 
+                     fontsize=10, y=0.98)
+
+        def plot_param(ax, data, title, cmap='jet'):
+            im = ax.contourf(xh, yh, data.T, 30, cmap=cmap)
+            ax.set_title(title, fontsize=8)
+            ax.set_aspect('equal')
+            plt.colorbar(im, ax=ax, shrink=0.8)
+
+        # Row 1: Thickness
+        plot_param(axes[0,0], t_ref, "Target Thickness (mm)")
+        plot_param(axes[0,1], t_opt, "Optimized Thickness (mm)")
         
-        # Difference
-        im2 = axes[1,0].contourf(xh, yh, (t_opt - t_ref).T, 30, cmap='RdBu_r')
-        axes[1,0].set_title("Thickness Difference (mm)")
-        plt.colorbar(im2, ax=axes[1,0])
+        # Row 2: Topography (Z)
+        plot_param(axes[1,0], z_ref, "Target Topography (Z)")
+        plot_param(axes[1,1], z_opt, "Optimized Topography (Z)")
         
-        # Z-Shape (constant in this script)
-        im3 = axes[1,1].contourf(xh, yh, opt_params_h['z'].reshape(Nx_h+1, Ny_h+1).T, 30, cmap='terrain')
-        axes[1,1].set_title("Topography (Z-Height)")
-        plt.colorbar(im3, ax=axes[1,1])
-        
-        plt.tight_layout()
+        plt.tight_layout(rect=[0, 0, 1, 0.94])
         plt.savefig("verify_3d_parameters.png", dpi=150)
         plt.close()
+        print(f"   -> Saved: verify_3d_parameters.png")
         
         # 5. Modal Verification
         print("Verifying Modal Response...")
@@ -577,83 +596,179 @@ class EquivalentSheetModel:
         
         macs = []
         for j in range(n_modes):
-            v1 = modes_opt[:, j] / np.linalg.norm(modes_opt[:, j])
-            v2 = modes_ref[:, j] / np.linalg.norm(modes_ref[:, j])
+            v1 = modes_opt[:, j] / (np.linalg.norm(modes_opt[:, j]) + 1e-12)
+            v2 = modes_ref[:, j] / (np.linalg.norm(modes_ref[:, j]) + 1e-12)
             macs.append(float((np.dot(v1, v2))**2))
             
-        # Modal Plot
+        # Modal Bar Plot
         plt.figure(figsize=(10, 5))
         plt.subplot(1, 2, 1)
-        plt.bar(np.arange(n_modes)-0.2, freq_ref, width=0.4, label='Target')
-        plt.bar(np.arange(n_modes)+0.2, freq_opt, width=0.4, label='Optimized')
-        plt.title("Frequency Comparison (Hz)")
+        plt.bar(np.arange(n_modes)-0.2, freq_ref, width=0.4, label='Target', color='royalblue')
+        plt.bar(np.arange(n_modes)+0.2, freq_opt, width=0.4, label='Optimized', color='orange')
+        plt.title("Frequency Comparison (Hz)", fontsize=10)
         plt.legend()
+        plt.xticks(np.arange(n_modes), np.arange(1, n_modes+1))
+        
         plt.subplot(1, 2, 2)
         plt.bar(np.arange(n_modes), macs, color='purple')
-        plt.axhline(0.9, color='red', linestyle='--')
-        plt.title("Modal Assurance Criterion (MAC)")
+        plt.axhline(0.9, color='red', linestyle='--', alpha=0.5)
+        plt.title("Modal Assurance Criterion (MAC)", fontsize=10)
         plt.ylim(0, 1.1)
+        plt.xticks(np.arange(n_modes), np.arange(1, n_modes+1))
+        
+        plt.tight_layout()
         plt.savefig("verify_3d_modes.png", dpi=150)
         plt.close()
         
         # 5.5 Mode Shape Visual Comparison Plot
         print("Generating Mode Shape contour comparison plots...")
-        n_plot_modes = min(3, n_modes)
-        fig, axes = plt.subplots(n_plot_modes, 2, figsize=(10, 4 * n_plot_modes))
-        if n_plot_modes == 1: axes = np.expand_dims(axes, axis=0) # Handle single mode case
-
+        n_plot_modes = n_modes # Plot all non-rigid modes as requested
+        fig = plt.figure(figsize=(3.5 * n_plot_modes, 7))
+        fig.suptitle(f"Mode Shape Comparison (Target vs Optimized)\nColormap: jet", fontsize=10)
+        
         for j in range(n_plot_modes):
-            # Reshape to 2D
+            # Normalization and Sign Alignment
             phi_ref = modes_ref[:, j].reshape(Nx_h+1, Ny_h+1)
-            phi_opt = modes_opt[:, j].reshape(Nx_h+1, Ny_h+1)
-            
-            # Normalize and handle sign flip (eigenvectors are sign-invariant)
             phi_ref = phi_ref / (np.max(np.abs(phi_ref)) + 1e-12)
-            phi_opt = phi_opt / (np.max(np.abs(phi_opt)) + 1e-12)
             
-            # Flip sign if negatively correlated
+            phi_opt = modes_opt[:, j].reshape(Nx_h+1, Ny_h+1)
+            phi_opt = phi_opt / (np.max(np.abs(phi_opt)) + 1e-12)
             if np.sum(phi_ref * phi_opt) < 0:
                 phi_opt = -phi_opt
-                
-            # Plot
-            im0 = axes[j,0].contourf(xh, yh, phi_ref.T, 30, cmap='RdBu_r', levels=np.linspace(-1, 1, 31))
-            axes[j,0].set_title(f"Target Mode {j+1} ({freq_ref[j]:.2f} Hz)")
-            axes[j,0].set_aspect('equal')
-            plt.colorbar(im0, ax=axes[j,0])
+
+            # Target (Top Row)
+            ax_tgt = fig.add_subplot(2, n_plot_modes, j+1)
+            im0 = ax_tgt.contourf(xh, yh, phi_ref.T, 30, cmap='jet', levels=np.linspace(-1, 1, 31))
+            ax_tgt.set_title(f"Target Mode {j+1}\n({freq_ref[j]:.2f} Hz)", fontsize=8)
+            ax_tgt.set_aspect('equal')
+            if j == 0: # Only show colorbar in the first column
+                cbar = plt.colorbar(im0, ax=ax_tgt, shrink=0.7)
+                cbar.ax.set_ylabel('Amplitude', fontsize=8)
             
-            im1 = axes[j,1].contourf(xh, yh, phi_opt.T, 30, cmap='RdBu_r', levels=np.linspace(-1, 1, 31))
-            axes[j,1].set_title(f"Optimized Mode {j+1} ({freq_opt[j]:.2f} Hz, MAC: {macs[j]:.3f})")
-            axes[j,1].set_aspect('equal')
-            plt.colorbar(im1, ax=axes[j,1])
+            # Optimized (Bottom Row)
+            ax_opt = fig.add_subplot(2, n_plot_modes, n_plot_modes + j+1)
+            im1 = ax_opt.contourf(xh, yh, phi_opt.T, 30, cmap='jet', levels=np.linspace(-1, 1, 31))
+            ax_opt.set_title(f"Opt Mode {j+1}\n({freq_opt[j]:.2f} Hz, MAC: {macs[j]:.3f})", fontsize=8)
+            ax_opt.set_aspect('equal')
+            if j == 0: # Only show colorbar in the first column
+                cbar = plt.colorbar(im1, ax=ax_opt, shrink=0.7)
+                cbar.ax.set_ylabel('Amplitude', fontsize=8)
             
-        plt.tight_layout()
-        plt.savefig("verify_mode_shapes.png", dpi=150)
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        plt.savefig("verify_3d_mode_shapes.png", dpi=150)
         plt.close()
-        print(f"   -> Saved: verify_mode_shapes.png")
+        print(f"   -> Saved: verify_3d_mode_shapes.png")
+        print(f"   -> Saved: verify_3d_mode_shapes.png")
         
-        # 6. Report Generation
+        # 6. Comprehensive Report Generation
+        print("Generating Enhanced Verification Report...")
+        
+        def calc_r2(ref, opt):
+            ss_res = np.sum((ref - opt)**2)
+            ss_tot = np.sum((ref - np.mean(ref))**2)
+            return 1 - (ss_res / (ss_tot + 1e-12))
+
+        def calc_mse(ref, opt):
+            return np.mean((ref - opt)**2)
+
+        # 6.1 Collect Case-by-Case Detailed Metrics
+        case_results = []
+        for i, case in enumerate(self.cases):
+            tgt = self.targets[i]
+            fd, fv, F_ext = case.get_bcs(self.fem_high)
+            free = np.setdiff1d(np.arange(self.fem_high.total_dof), fd)
+            u_opt = self.fem_high.solve_static_partitioned(K_opt, F_ext, jnp.array(free), fd, fv)
+            u_ref = tgt['u_full']
+            
+            # 1. Displacement
+            w_ref, w_opt = tgt['u_static'], u_opt[2::6]
+            max_w_ref, max_w_opt = np.max(np.abs(w_ref)), np.max(np.abs(w_opt))
+            
+            # 2. Reaction Forces (at fixed DOFs)
+            R_vec_ref = (np.array(K_opt @ u_ref) - F_ext)[2::6] # Simplified Z-component reactions
+            R_vec_opt = (np.array(K_opt @ u_opt) - F_ext)[2::6]
+            max_R_ref, max_R_opt = np.max(np.abs(tgt['reaction_full'][2::6])), np.max(np.abs(R_vec_opt))
+            
+            # 3. Bending Moments (Using compute_moment)
+            M_ref_vec = self.fem_high.compute_moment(u_ref, self.target_params_high)
+            M_opt_vec = self.fem_high.compute_moment(u_opt, opt_params_h)
+            max_M_ref = np.max(np.sqrt(np.sum(M_ref_vec**2, axis=1))) # Max resultant moment magnitude
+            max_M_opt = np.max(np.sqrt(np.sum(M_opt_vec**2, axis=1)))
+            
+            # Overall Accuracy for this case
+            _, sim = get_metrics(w_ref, w_opt)
+            r2 = calc_r2(w_ref, w_opt)
+            mse = calc_mse(w_ref, w_opt)
+
+            case_results.append({
+                'name': case.name,
+                'max_w': (max_w_ref, max_w_opt),
+                'max_R': (max_R_ref, max_R_opt),
+                'max_M': (max_M_ref, max_M_opt),
+                'sim': sim, 'r2': r2, 'mse': mse
+            })
+
         report = []
-        report.append("# Equivalent Sheet Optimization Verification Report")
-        report.append(f"Model Size: {self.fem.Lx} x {self.fem.Ly} mm")
-        report.append(f"Target Resolution: {Nx_h} x {Ny_h}")
-        report.append(f"Optimizer Resolution: {self.fem.nx} x {self.fem.ny}\n")
+        report.append("# 📊 Professional Structural Optimization Verification Report")
+        report.append(f"**Date:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        report.append(f"**Domain:** {self.fem.Lx}mm x {self.fem.Ly}mm | **Material:** E={target_config.get('base_E', 210000)}MPa, v=0.3")
+        report.append(f"**Resolution:** Target({Nx_h}x{Ny_h}) vs. Optimized({self.fem.nx}x{self.fem.ny})\n")
+
+        report.append("## 1. 🎯 Optimization Metric Guide")
+        report.append("| Metric | Full Name | Physical Meaning | Target |")
+        report.append("| :--- | :--- | :--- | :---: |")
+        report.append("| **R²** | Coeff. of Determination | Statistical correlation (1.0 is perfect) | > 0.90 |")
+        report.append("| **MAC** | Modal Assurance Criterion | Mode shape similarity (1.0 is identical) | > 0.85 |")
+        report.append("| **Similarity** | Accuracy Index | Range-scaled error metric | > 90% |")
+        report.append("\n")
+
+        report.append("## 2. 🏗️ Static Response Comparison")
+        report.append("Detailed comparison of peak structural responses across all load cases.")
+        report.append("| Load Case | Metric | Target Result | Optimized Result | Error (%) | Status |")
+        report.append("| :--- | :--- | :---: | :---: | :---: | :---: |")
         
-        report.append("## 1. Static Results Similarity")
-        report.append("| Case | Disp Similarity (%) | Stress Similarity (%) | Strain Similarity (%) |")
-        report.append("| :--- | :---: | :---: | :---: |")
-        for res in static_summary:
-            report.append(f"| {res['name']} | {res['disp_sim']:.2f}% | {res['stress_sim']:.2f}% | {res['strain_sim']:.2f}% |")
-        
-        report.append("\n## 2. Modal Results")
-        report.append("| Mode | Target Freq (Hz) | Opt Freq (Hz) | Error (%) | MAC |")
+        for res in case_results:
+            def row(label, ref, opt, unit, tol=5.0):
+                err = abs(ref - opt) / (abs(ref) + 1e-12) * 100
+                stat = "✔" if err < tol else "⚠"
+                return f"| {res['name']:<10} | {label:<10} | {ref:10.3f} {unit} | {opt:10.3f} {unit} | {err:8.2f}% | {stat:^6} |"
+            
+            report.append(row("Max Disp", res['max_w'][0], res['max_w'][1], "mm"))
+            report.append(row("Max Reac", res['max_R'][0], res['max_R'][1], "N"))
+            report.append(row("Max Moment", res['max_M'][0], res['max_M'][1], "Nmm"))
+            report.append("| " + "-"*10 + " | " + "-"*10 + " | " + "-"*12 + " | " + "-"*12 + " | " + "-"*10 + " | " + "-"*6 + " |")
+        report.append("\n")
+
+        report.append("## 3. 📈 Correlation Statistics")
+        report.append("| Load Case | Similarity Index | R² (Disp) | MSE (Disp) | Result Status |")
         report.append("| :--- | :---: | :---: | :---: | :---: |")
+        for res in case_results:
+            status = "✔ EXCELLENT" if res['r2'] > 0.95 else ("OK" if res['r2'] > 0.85 else "❌ FAIL")
+            report.append(f"| {res['name']:<10} | {res['sim']:15.2f}% | {res['r2']:10.4f} | {res['mse']:10.2e} | {status:^12} |")
+        report.append("\n")
+
+        report.append("## 4. 🎵 Dynamic Modal Performance")
+        report.append("| Mode No. | Target Freq (Hz) | Opt Freq (Hz) | Error (%) | MAC Value | Status |")
+        report.append("| :---: | :---: | :---: | :---: | :---: | :---: |")
         for j in range(n_modes):
             err = abs(freq_opt[j] - freq_ref[j])/freq_ref[j]*100
-            report.append(f"| {j+1} | {freq_ref[j]:.2f} | {freq_opt[j]:.2f} | {err:.2f}% | {macs[j]:.4f} |")
-        
+            status = "✔ PASS" if macs[j] > 0.9 else "⚠ CHECK"
+            report.append(f"| {j+1:^8} | {freq_ref[j]:15.2f} | {freq_opt[j]:12.2f} | {err:8.2f}% | {macs[j]:9.4f} | {status:^6} |")
+        report.append("\n")
+
+        report.append("## 5. 📐 Geometry Accuracy")
+        report.append("| Parameter | RMSE | Correlation | Mean (Target) | Mean (Opt) |")
+        report.append("| :--- | :---: | :---: | :---: | :---: |")
+        report.append(f"| Thickness (t) | {t_rmse:8.4f} | {t_corr:11.4f} | {np.mean(t_ref):10.3f} | {np.mean(t_opt):8.3f} |")
+        report.append(f"| Topography (z) | {z_rmse:8.4f} | {z_corr:11.4f} | {np.mean(z_ref):10.3f} | {np.mean(z_opt):8.3f} |")
+        report.append("\n")
+
+        report.append("---")
+        report.append("*End of Automated Verification Report.*")
+
         with open("verification_report.md", "w", encoding='utf-8') as f:
             f.write("\n".join(report))
-        print("\n✔ Verification report saved to: verification_report.md")
+        print("\n✔ Comprehensive verification report saved: verification_report.md")
         print("✔ Verification plots saved: verify_3d_*.png")
 
         # 7. Final Interactive Stage (PyVista) - Optional but good for inspection
@@ -676,13 +791,16 @@ if __name__ == '__main__':
     model.add_case(TwistCase("twist_x", axis='x', value=1.5, mode='angle', weight=1.0))
     model.add_case(TwistCase("twist_y", axis='y', value=1.5, mode='angle', weight=1.0))
     model.add_case(PureBendingCase("bend_y", axis='y', value=3.0, mode='angle', weight=1.0))
+    model.add_case(PureBendingCase("bend_x", axis='x', value=3.0, mode='angle', weight=1.0))
     model.add_case(CornerLiftCase("lift_br", corner='br', value=5.0, mode='disp', weight=1.0))
+    model.add_case(CornerLiftCase("lift_tl", corner='tl', value=5.0, mode='disp', weight=1.0))
+    model.add_case(TwoCornerLiftCase("lift_tl_br", corners=['br', 'tl'], value=5.0, mode='disp', weight=1.0))
     
     # 3. Ground Truth Generation (target_config)
     target_config = {
         'pattern': 'ABC',           'base_t': 1.0, 
-        'bead_t': {'A': 2.0, 'B': 2.5, 'C': 1.5},
-        'pattern_pz': 'TNY',       # 'bead_pz': {'T': 2.0, 'N': 1.0, 'Y': -2.0},
+        #'bead_t': {'A': 2.0, 'B': 2.5, 'C': 1.5},
+        'pattern_pz': 'TNY',        'bead_pz': {'T': 5.0, 'N': 3.0, 'Y': -2.0},
         'base_rho': 7.85e-9,        'base_E': 210000.0,
     }
     
@@ -690,31 +808,44 @@ if __name__ == '__main__':
     
     # 4. Optimization Search Space (opt_config)
     opt_config = {
-        't':   {'opt': True, 'init': 1.2,      'min': 0.5,    'max': 5.0},
-        'rho': {'opt': True, 'init': 7.85e-9,   'min': 5e-9,   'max': 1e-8},
-        'E':   {'opt': True, 'init': 200000.0,  'min': 50000,  'max': 300000},
-        'pz':   {'opt': True, 'init': 0.0,  'min': -5.0,  'max': 5.0},
+        't':   {'opt': False, 'init': 1.0,      'min': 0.5,    'max': 5.0},
+        'rho': {'opt': False, 'init': 7.85e-9,   'min': 5e-9,   'max': 1e-8},
+        'E':   {'opt': False, 'init': 210000.0,  'min': 50000,  'max': 300000},
+        'pz':   {'opt': True, 'init': 0.0,  'min': -15.0,  'max': 15.0},
     }
     
     # 5. Full Loss Weights (as previously defined)
     weights = {
         'static': 1.0,           # Displacement matching
         'freq': 1.0,            # [Very Low] frequency matching
-        'mode': 0.01,           # [Gentle] Mode matching (MAC) - Start small to avoid shock
+        'mode': 1.0,           # [Gentle] Mode matching (MAC) - Start small to avoid shock
         'curvature': 0.0,        # [Legacy]
         'moment': 0.0,           # [Legacy]
-        'strain_energy': 2.0,    # Strain energy density matching
-        'surface_stress': 2.0,   # Surface stress matching
-        'surface_strain': 2.0,   # Surface strain matching
-        'mass': 0.0,            # Mass constraint
-        'reg': 0.001             # Regularization
+        'strain_energy': 1.0,    # Strain energy density matching
+        'surface_stress': 1.0,   # Surface stress matching
+        'surface_strain': 1.0,   # Surface strain matching
+        'mass': 1.0,            # Mass constraint
+        'reg': 0.01             # Regularization
     }
     
     # Run Optimization
     # Enable all metrics for comprehensive tracking
+    # 참고: optax.warmup_cosine_decay_schedule 
     try:
-        model.optimize(opt_config, weights, use_smoothing=False, 
-                       use_strain_energy=True, use_surface_stress=True, use_surface_strain=True)
+        model.optimize(opt_config, weights, 
+                       use_smoothing=False, 
+                       use_strain_energy=True, 
+                       use_surface_stress=True, 
+                       use_surface_strain=True,                 
+                       use_mass_constraint=True, 
+                       mass_tolerance=0.05,
+                       max_iterations=300, 
+                       use_early_stopping=True, 
+                       early_stop_patience=100, 
+                       early_stop_tol=1e-8,
+                       learning_rate=1.0,
+                       num_modes_loss=5,
+                       min_bead_width=10.0)
         
         # 6. Verify and Report
         model.verify()
@@ -722,3 +853,25 @@ if __name__ == '__main__':
         import traceback
         traceback.print_exc()
         print(f"\n[CRITICAL ERROR] Optimization failed: {e}")
+
+# ==============================================================================
+# [DEVELOPMENT NOTES & FUTURE CONSIDERATIONS]
+# ==============================================================================
+# The following features were implemented but removed in the 2026-02-12 update 
+# due to convergence stability issues. They remains as candidates for future tuning:
+#
+# 1. Automatic Loss Normalization (safe_norm):
+#    - Concept: Dividing each loss component by its initial value to auto-scale weights.
+#    - Issue: Highly accurate initial metrics (e.g., matching frequencies) were 
+#      over-weighted, preventing progress in high-error domains like displacement.
+#
+# 2. Log-scale Frequency Matching (jnp.log):
+#    - Concept: Matching frequency order-of-magnitude.
+#    - Issue: Less sensitive to precision matching (< 1Hz) compared to linear scale 
+#      residual: (curr/tgt - 1)^2.
+#
+# 3. LR Warm-up Cosine Decay Schedule:
+#    - Concept: Starting with very low LR to stabilize initial gradients.
+#    - Issue: Delayed initial convergence for well-posed topography tasks. 
+#      Linear decay from peak LR proved more efficient for current load cases.
+# ==============================================================================

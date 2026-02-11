@@ -148,7 +148,7 @@ def stage1_visualize_patterns(nx, ny, x_grid, y_grid, t_field, z_field):
         
         # Exit on 0 or empty input
         if not choice or choice == '0':
-            print("✓ Proceeding to Ground Truth generation...")
+            print("[OK] Proceeding to Ground Truth generation...")
             break
             
         # Setup plotter for this view
@@ -281,13 +281,51 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
             modes = eigen_data['modes']
             
             print("\n Available Modes:")
+            print(" 0: [SPLIT VIEW] View All Modes")
             for i, val in enumerate(vals):
                 freq_hz = np.sqrt(max(0, val)) / (2 * np.pi)
                 print(f" Mode {i+1}: {freq_hz:.2f} Hz")
                 
             try:
-                m_idx = int(input(">> Select Mode Number: ")) - 1
-                if 0 <= m_idx < len(vals):
+                m_input = input(">> Select Mode Number (0 for All): ").strip()
+                if not m_input: continue
+                m_idx = int(m_input) - 1
+                
+                if m_input == '0':
+                    # VIEW ALL MODES in a Grid
+                    n_modes = len(vals)
+                    if n_modes <= 3:
+                        rows, cols = 1, n_modes
+                    elif n_modes == 4:
+                        rows, cols = 2, 2
+                    elif n_modes <= 6:
+                        rows, cols = 3, 2
+                    else:
+                        cols = 3
+                        rows = int(np.ceil(n_modes / 3))
+                        
+                    p = setup_plotter(f"All Eigenmodes (Scale: {scale}x)", shape=(rows, cols))
+                    
+                    for i in range(n_modes):
+                        r, c = i // cols, i % cols
+                        p.subplot(r, c)
+                        
+                        freq_hz = np.sqrt(max(0, vals[i])) / (2 * np.pi)
+                        w_mode = np.array(modes[:, i])
+                        
+                        grid = pv.StructuredGrid()
+                        z_deformed = z + w_mode * scale
+                        grid.points = np.column_stack([x, y, z_deformed])
+                        grid.dimensions = [ny + 1, nx + 1, 1]
+                        grid["Mode Shape"] = w_mode
+                        
+                        p.add_mesh(grid, scalars="Mode Shape", show_edges=True, cmap="coolwarm")
+                        p.add_text(f"Mode {i+1}: {freq_hz:.2f} Hz", position='upper_right', font_size=8)
+                        
+                    p.link_views()
+                    p.show()
+                
+                elif 0 <= m_idx < len(vals):
                     freq_hz = np.sqrt(max(0, vals[m_idx])) / (2 * np.pi)
                     
                     # Prepare Mesh for Mode Shape
@@ -315,14 +353,14 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
             try:
                 new_scale = float(input(f"Enter new scale factor (current: {scale}): "))
                 scale = new_scale
-                print(f"✓ Scale updated to {scale}x")
+                print(f"[OK] Scale updated to {scale}x")
             except ValueError:
                 print("⚠ Invalid input. Scale unchanged.")
             continue
 
         # Exit on 0 or empty input
         if not choice or choice == '0':
-            print("✓ Proceeding to optimization...")
+            print("[OK] Proceeding to optimization...")
             break
             
         # Parse and validate user input
@@ -362,12 +400,12 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
         elif type_choice == 'B':
             field_name = "Max Surface Strain (-)"
             scalars = np.array(tgt['max_surface_strain'])
-            cmap = 'plasma'
+            cmap = 'jet'
             title_prefix = "Strain"
         elif type_choice == 'C':
             field_name = "Max Surface Stress (MPa)"
             scalars = np.array(tgt['max_surface_stress'])
-            cmap = 'inferno'
+            cmap = 'jet'
             title_prefix = "Stress"
 
         # Compute Summary Statistics (Displayed on Screen)
@@ -493,7 +531,7 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
 # STAGE 3: POST-OPTIMIZATION COMPARISON
 # ==============================================================================
 
-def stage3_visualize_comparison(fem_high, targets, optimized_params, target_params, opt_eigen=None, tgt_eigen=None):
+def stage3_visualize_comparison(fem_high, targets, optimized_params, target_params, opt_eigen=None, tgt_eigen=None, history_file="verify_3d_opt_history.png"):
     """
     [STAGE 3] Interactive side-by-side comparison of target vs optimized results.
     
@@ -517,38 +555,21 @@ def stage3_visualize_comparison(fem_high, targets, optimized_params, target_para
         - 'E': Young's modulus field
     target_params : dict
         Ground truth parameter fields (same structure as optimized_params)
+    opt_eigen, tgt_eigen : dict, optional
+        Eigenvalue data for comparison
+    history_file : str, optional
+        Path to the convergence history plot PNG
         
     User Interface:
     ---------------
     Menu Loop:
         1: Compare thickness fields
         2: Compare Z-shape (topography) fields  
+        3: Compare Eigenmodes (if available)
+        H: View Optimization History (Convergence Plot)
         0 or Enter: Exit program
-        
-    Technical Details:
-    ------------------
-    - Uses (1, 2) subplot layout for side-by-side comparison
-    - Views are linked: rotating one viewport rotates the other
-    - Same colormap scale for both sides (facilitates comparison)
-    - Mesh edges shown for spatial reference
-    
-    Extensions:
-    -----------
-    Future versions could add:
-    - Difference plot (center panel showing target - optimized)
-    - Histogram comparison of parameter distributions
-    - Line profiles along plate centerlines
-    
-    Example:
-    --------
-    >>> # After optimization completes
-    >>> stage3_visualize_comparison(
-    ...     fem_high=model.fem_high,
-    ...     targets=model.targets,
-    ...     optimized_params=model.optimized_params,
-    ...     target_params=model.target_params_high
-    ... )
     """
+    import os
     # Extract mesh coordinates
     nx, ny = fem_high.nx, fem_high.ny
     x = np.array(fem_high.node_coords[:, 0])
@@ -564,15 +585,25 @@ def stage3_visualize_comparison(fem_high, targets, optimized_params, target_para
         print(" 2: Compare Z-Shape Fields (Target vs Optimized)")
         if opt_eigen and tgt_eigen:
             print(" 3: Compare Eigenmodes (Frequencies & Shapes)")
+        print(" H: View Optimization History (Convergence Plot)")
         print(" 0: Cancel / Exit Program (or press Enter)")
         print("="*70)
-        choice = input(">> Your choice [0-3]: ").strip()
+        choice = input(">> Your choice [0-3/H]: ").strip().upper()
         
         # Exit on 0 or empty input
         if not choice or choice == '0':
-            print("✓ Exiting visualization system...")
+            print("[OK] Exiting visualization system...")
             break
             
+        # Handle Optimization History
+        if choice == 'H':
+            if os.path.exists(history_file):
+                print(f" -> Opening {history_file}...")
+                os.startfile(history_file) # Windows-specific as per system requirement
+            else:
+                print(f" ⚠ History file not found: {history_file}")
+            continue
+
         # Setup split-screen plotter (1 row, 2 columns)
         p = setup_plotter(
             "Final Comparison: TARGET (Left) vs OPTIMIZED (Right)", 
@@ -585,6 +616,7 @@ def stage3_visualize_comparison(fem_high, targets, optimized_params, target_para
             data_optimized = np.array(optimized_params['t']).flatten()
             field_name = "Thickness"
             units = "mm"
+            cmap = "viridis"
         elif choice == '2':
             data_target = np.array(target_params['z']).flatten()
             data_optimized = np.array(optimized_params['z']).flatten()

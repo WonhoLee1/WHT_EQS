@@ -171,3 +171,117 @@ class CornerLiftCase(LoadCase):
             F = F.at[target_idx*6 + 2].set(self.value)
         
         return jnp.array(fixed_dofs), jnp.array(fixed_vals), F
+
+# ==============================================================================
+# TWO CORNER LIFT LOAD CASE (Two active, two fully fixed)
+# ==============================================================================
+class TwoCornerLiftCase(LoadCase):
+    def __init__(self, name, corners=['br', 'tl'], value=5.0, mode='disp', weight=1.0):
+        """
+        Args:
+            corners (list): List of 2 corners to lift (e.g., ['br', 'tl'])
+            value (float): Displacement (mm) or Force (N)
+            mode (str): 'disp' or 'force'
+        """
+        super().__init__(name, weight)
+        if len(corners) != 2:
+            raise ValueError("TwoCornerLiftCase requires exactly 2 corners.")
+        self.corners = corners
+        self.value = value
+        self.mode = mode
+        
+    def get_bcs(self, fem):
+        coords = fem.node_coords
+        idx_bl = jnp.argmin(coords[:,0]**2 + coords[:,1]**2)
+        idx_br = jnp.argmin((coords[:,0]-fem.Lx)**2 + coords[:,1]**2)
+        idx_tl = jnp.argmin(coords[:,0]**2 + (coords[:,1]-fem.Ly)**2)
+        idx_tr = jnp.argmin((coords[:,0]-fem.Lx)**2 + (coords[:,1]-fem.Ly)**2)
+        
+        all_corners = {'bl': idx_bl, 'br': idx_br, 'tl': idx_tl, 'tr': idx_tr}
+        
+        fixed_dofs = []
+        fixed_vals = []
+        F = jnp.zeros(fem.total_dof)
+        
+        for name, idx in all_corners.items():
+            if name in self.corners:
+                # Active Corner: Apply Z-load or Z-disp
+                if self.mode == 'disp':
+                    fixed_dofs.append(idx*6 + 2) # Fix w
+                    fixed_vals.append(self.value)
+                elif self.mode == 'force':
+                    F = F.at[idx*6 + 2].set(self.value)
+                # Other DOFs (u, v, tx, ty, tz) remain FREE
+            else:
+                # Inactive Corner: FULLY FIXED (6-DOF)
+                for dof_offset in range(6):
+                    fixed_dofs.append(idx*6 + dof_offset)
+                    fixed_vals.append(0.0)
+        
+        return jnp.array(fixed_dofs), jnp.array(fixed_vals), F
+# ==============================================================================
+# POSITIONAL LOAD CASE (General Mesh / External / ROI)
+# ==============================================================================
+class PositionalCase(LoadCase):
+    def __init__(self, name, weight=1.0):
+        super().__init__(name, weight)
+        self.fixed_regions = [] # List of {'box': (min, max) or 'radius': (center, r), 'dofs': [], 'vals': []}
+        self.loads = []         # List of {'box': ..., 'dofs_vals': {dof_idx: val}}
+
+    def add_fixed_box(self, x_range=None, y_range=None, z_range=None, dofs=[0,1,2,3,4,5], vals=0.0):
+        self.fixed_regions.append({
+            'type': 'box', 'range': (x_range, y_range, z_range), 
+            'dofs': dofs, 'vals': vals
+        })
+
+    def add_fixed_radius(self, center, radius, dofs=[0,1,2,3,4,5], vals=0.0):
+        self.fixed_regions.append({
+            'type': 'radius', 'center': center, 'radius': radius, 
+            'dofs': dofs, 'vals': vals
+        })
+
+    def add_load_box(self, x_range=None, y_range=None, z_range=None, dof_val_dict={2: -1.0}):
+        self.loads.append({
+            'type': 'box', 'range': (x_range, y_range, z_range), 
+            'dofs_vals': dof_val_dict
+        })
+
+    def get_bcs(self, fem):
+        import WHT_EQS_mesh as mesh
+        coords = fem.node_coords
+        F = jnp.zeros(fem.total_dof)
+        fixed_dofs = []
+        fixed_vals = []
+
+        # 1. Process Fixed Regions
+        for reg in self.fixed_regions:
+            if reg['type'] == 'box':
+                xr, yr, zr = reg['range']
+                nodes = mesh.get_nodes_in_box(coords, xr, yr, zr)
+            else:
+                nodes = mesh.get_nodes_in_radius(coords, reg['center'], reg['radius'])
+            
+            for node in nodes:
+                idx_start = node * 6
+                for d_offset in reg['dofs']:
+                    fixed_dofs.append(idx_start + d_offset)
+                    # Support both single value or list of values
+                    if isinstance(reg['vals'], (list, np.ndarray, jnp.ndarray)):
+                        fixed_vals.append(reg['vals'][d_offset])
+                    else:
+                        fixed_vals.append(reg['vals'])
+
+        # 2. Process Loads
+        for load in self.loads:
+            if load['type'] == 'box':
+                xr, yr, zr = load['range']
+                nodes = mesh.get_nodes_in_box(coords, xr, yr, zr)
+            
+            if len(nodes) > 0:
+                # Distribute total load among nodes? Or apply to each?
+                # Usually we apply per node if not specified.
+                for node in nodes:
+                    for d_offset, val in load['dofs_vals'].items():
+                        F = F.at[node * 6 + d_offset].add(val)
+
+        return jnp.array(fixed_dofs), jnp.array(fixed_vals), F
