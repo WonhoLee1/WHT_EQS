@@ -23,8 +23,8 @@ from WHT_EQS_visualization import (
 
 # Mesh Settings
 Lx, Ly = 1000.0, 400.0
-Nx_high, Ny_high = 50, 20      # High-res ground truth
-Nx_low, Ny_low = 30, 12        # Low-res optimization mesh
+Nx_high, Ny_high = 25, 10      # High-res ground truth
+Nx_low, Ny_low = 25, 10        # Low-res optimization mesh
 
 class EquivalentSheetModel:
     def __init__(self, Lx, Ly, nx, ny):
@@ -33,6 +33,7 @@ class EquivalentSheetModel:
         self.targets = []
         self.resolution_high = (50, 20)
         self.target_mass = 0.0
+        self.target_start_idx = 6 # Default for Free-Free
         self.optimized_params = None
         self.target_params_high = None
 
@@ -162,6 +163,7 @@ class EquivalentSheetModel:
         
         print(f" -> Found first elastic mode at index {start_idx} ({all_freqs_h[start_idx]:.2f} Hz)")
 
+        self.target_start_idx = start_idx
         self.target_eigen = {
             'vals': vals[start_idx : start_idx + num_modes_save],
             'modes': vecs[2::6, start_idx : start_idx + num_modes_save] # W-component
@@ -313,19 +315,36 @@ class EquivalentSheetModel:
             vals, vecs = self.fem.solve_eigen(K, M, num_modes=len(t_vals)+10)
             freqs = jnp.sqrt(jnp.maximum(vals, 0.0)) / (2 * jnp.pi)
             
-            # Smart Elastic Mode Detection (Log-Gap Method)
-            # Find the largest relative jump between consecutive modes in the RBM range
+            # 1. Dynamic Elastic Mode Selection (Physically Consistent)
+            # Find the actual first elastic mode index in the current iteration
+            # to handle cases where the model starts Flat (6 RBMs) and evolves to Topography (possibly fewer/different RBMs)
             log_f = jnp.log(jnp.maximum(freqs[:15], 1e-6))
             gaps = jnp.concatenate([jnp.zeros(1), log_f[1:] - log_f[:-1]])
-            idx = jnp.argmax((freqs > 1.0) & (gaps > 1.0) | (freqs > 20.0))
+            current_idx = jnp.argmax((freqs > 1.0) & (gaps > 1.0) | (freqs > 20.0))
             
-            # Frequency matching: Simple relative error (Linear scale) for better sensitivity
-            curr_vals = jax.lax.dynamic_slice_in_dim(vals, idx, len(t_vals))
+            n_tgt = len(t_vals)
+            search_window = 2  # Allow searching in n_tgt + 2 candidates to handle swaps
+            
+            # 2. Frequency Matching (Relative Error on Eigenvalues)
+            # Match current elastic modes to target elastic modes
+            curr_vals = jax.lax.dynamic_slice_in_dim(vals, current_idx, n_tgt)
             l_freq = jnp.mean((curr_vals / (t_vals + 1e-6) - 1.0)**2)
             
-            modes_w = jax.lax.dynamic_slice_in_dim(vecs[2::6, :], idx, len(t_vals), axis=1)
-            l_mode = jnp.mean(1.0 - jnp.sum(modes_w * t_modes_l, axis=0)**2 / (jnp.sum(modes_w**2, axis=0)*jnp.sum(t_modes_l**2, axis=0) + 1e-10))
-            f1_hz = freqs[idx]
+            # 3. Best-Fit MAC Matrix Matching (Mode Tracking)
+            # Slice candidates starting from the detected elastic index
+            cand_modes = jax.lax.dynamic_slice_in_dim(vecs[2::6, :], current_idx, n_tgt + search_window, axis=1)
+            
+            # Compute MAC Matrix [n_target, n_candidates]
+            dots = jnp.dot(t_modes_l.T, cand_modes) # (n_tgt, n_tgt + search_window)
+            norm_t = jnp.sum(t_modes_l**2, axis=0, keepdims=True) # (1, n_tgt)
+            norm_c = jnp.sum(cand_modes**2, axis=0, keepdims=True) # (1, n_tgt + search_window)
+            mac_matrix = (dots**2) / (norm_t.T @ norm_c + 1e-10)
+            
+            # For each target mode, find the highest MAC value in the candidate window
+            best_mac_per_target = jnp.max(mac_matrix, axis=1)
+            l_mode = jnp.mean(1.0 - best_mac_per_target)
+            
+            f1_hz = jnp.sqrt(jnp.maximum(vals[current_idx], 0.0)) / (2 * jnp.pi)
 
             l_mass = jnp.abs((jnp.sum(p_actual['t'] * p_actual['rho']) * (self.fem.Lx/Nx_l)*(self.fem.Ly/Ny_l) - self.target_mass) / self.target_mass) if use_mass_constraint else 0.0
             for k in ['t', 'pz']:
@@ -340,7 +359,7 @@ class EquivalentSheetModel:
                           l_mass   * loss_weights.get('mass', 0.0) +
                           l_reg    * loss_weights.get('reg', 0.0))
                           
-            return total_loss, {'Total': total_loss, 'Disp': l_static, 'Start': l_stress, 'Strn': l_strain, 'Engy': l_energy, 'Freq': l_freq, 'Mode': l_mode, 'Mass': l_mass, 'Reg': l_reg, 'f1_hz': f1_hz}
+            return total_loss, {'Total': total_loss, 'Disp': l_static, 'Strs': l_stress, 'Strn': l_strain, 'Engy': l_energy, 'Freq': l_freq, 'Mode': l_mode, 'Mass': l_mass, 'Reg': l_reg, 'f1_hz': f1_hz}
 
         # Clear initial metrics logic
         print("Optimization Engine Ready. Initializing search...")
@@ -351,8 +370,8 @@ class EquivalentSheetModel:
         self.history = [] # To store optimization trajectory
         
         print("\n [Tip] Press 'q' to stop optimization and use the best result found so far.\n")
-        print(f"{'Iter':<5} | {'Total_Norm':<10} | {'Disp':<9} | {'Strs':<9} | {'Strn':<9} | {'Engy':<9} | {'Freq':<9} | {'Mode':<9} | {'Freq1':<6}")
-        print("-" * 105)
+        print(f"{'Iter':<5} | {'Total_Norm':<10} | {'Disp':<9} | {'Strs':<9} | {'Strn':<9} | {'Engy':<9} | {'Freq':<9} | {'Mode':<9} | {'Mass':<9} | {'Freq1':<6}")
+        print("-" * 117)
 
         for i in range(max_iterations):
             (val, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, fixed_params_scaled, self.scaling)
@@ -362,6 +381,22 @@ class EquivalentSheetModel:
             
             updates, opt_state = optimizer.update(jax.tree_util.tree_map(lambda g: jnp.where(jnp.isfinite(g), g, 0.0), grads), opt_state)
             params = optax.apply_updates(params, updates)
+            
+            # --- Record Parameter Statistics ---
+            current_phys = {k: v * self.scaling[k] for k, v in params.items()}
+            current_phys.update({k: v * self.scaling[k] for k, v in fixed_params_scaled.items()})
+            
+            p_stats = {}
+            for pk in ['t', 'rho', 'E', 'pz']:
+                if pk in current_phys:
+                    arr = current_phys[pk]
+                    p_stats.update({
+                        f'{pk}_mean': float(jnp.mean(arr)),
+                        f'{pk}_std':  float(jnp.std(arr)),
+                        f'{pk}_min':  float(jnp.min(arr)),
+                        f'{pk}_max':  float(jnp.max(arr))
+                    })
+            self.history[-1].update(p_stats)
             
             # Parameter Clipping (Safety)
             for k in params:
@@ -387,7 +422,7 @@ class EquivalentSheetModel:
                     params = best_params
                     break
 
-            if i % 10 == 0: print(f"{i:<5d} | {val:<10.3f} | {metrics['Disp']:<9.2e} | {metrics['Start']:<9.2e} | {metrics['Strn']:<9.2e} | {metrics['Engy']:<9.2e} | {metrics['Freq']:<9.2e} | {metrics['Mode']:<9.2e} | {metrics['f1_hz']:<6.2f}")
+            if i % 10 == 0: print(f"{i:<5d} | {val:<10.3f} | {metrics['Disp']:<9.2e} | {metrics['Strs']:<9.2e} | {metrics['Strn']:<9.2e} | {metrics['Engy']:<9.2e} | {metrics['Freq']:<9.2e} | {metrics['Mode']:<9.2e} | {metrics['Mass']:<9.2e} | {metrics['f1_hz']:<6.2f}")
 
         # Final Assignment
         params = best_params
@@ -400,35 +435,106 @@ class EquivalentSheetModel:
         return self.optimized_params
 
     def plot_optimization_history(self):
-        """Generates a line plot of the optimization convergence history."""
+        """Generates a grid of line plots for each optimization metric to handle scale differences."""
         if not hasattr(self, 'history') or len(self.history) == 0:
             print(" -> No history data to plot.")
             return
 
-        print("Generating Convergence History Plot...")
+        print("Generating Detailed Convergence History Grid (N x M)...")
         iters = np.arange(len(self.history))
-        keys = [k for k in self.history[0].keys() if k != 'f1_hz']
         
-        plt.figure(figsize=(10, 6))
+        # Identify all keys to plot (excluding metadata/statistics)
+        all_keys = ['Total', 'Disp', 'Strs', 'Strn', 'Engy', 'Freq', 'Mode', 'Mass', 'Reg']
+        keys_to_plot = [k for k in all_keys if k in self.history[0]]
+        
+        n_plots = len(keys_to_plot)
+        cols = 3
+        rows = int(np.ceil(n_plots / cols))
+        
+        plt.figure(figsize=(15, 4 * rows))
         plt.rcParams.update({'font.size': 8})
         
-        for k in keys:
-            vals = np.array([h[k] for h in self.history])
-            init_val = vals[0] if abs(vals[0]) > 1e-12 else 1.0
-            relative_vals = vals / init_val
-            plt.plot(iters, relative_vals, label=f"{k} (Rel.)", linewidth=1.5)
-
-        plt.xlabel("Iteration", fontsize=9)
-        plt.ylabel("Value Relative to Initial (v/v0)", fontsize=9)
-        plt.title("Optimization Convergence History", fontsize=10)
-        plt.yscale('log') # Log scale is often better for convergence
-        plt.grid(True, which="both", ls="-", alpha=0.2)
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-        plt.tight_layout()
+        colors = plt.cm.viridis(np.linspace(0, 0.8, n_plots))
         
+        for idx, k in enumerate(keys_to_plot):
+            plt.subplot(rows, cols, idx + 1)
+            
+            vals = np.array([h[k] for h in self.history])
+            init_val = vals[0] if abs(vals[0]) > 1e-15 else 1.0
+            relative_vals = vals / init_val
+            
+            plt.plot(iters, relative_vals, color=colors[idx], linewidth=1.5)
+            plt.axhline(1.0, color='red', linestyle='--', alpha=0.3, linewidth=1) # Baseline
+            
+            # Use log scale only if the reduction is significant (more than 2 decades)
+            if np.max(relative_vals) / (np.min(relative_vals) + 1e-15) > 100:
+                plt.yscale('log')
+            
+            plt.title(f"{k} Convergence", fontsize=10, fontweight='bold')
+            plt.xlabel("Iteration")
+            plt.ylabel("Rel. Value (v/v0)")
+            plt.grid(True, which="both", ls="-", alpha=0.2)
+            
+            # Print final improvement in the plot
+            final_rel = relative_vals[-1]
+            plt.text(0.95, 0.95, f"Final: {final_rel:.2e}", transform=plt.gca().transAxes, 
+                     ha='right', va='top', fontsize=8, bbox=dict(facecolor='white', alpha=0.5))
+
+        plt.suptitle("Optimization Convergence Metrics (Independent Scaling)", fontsize=14, fontweight='bold', y=1.02)
+        plt.tight_layout()
         plt.savefig("verify_3d_opt_history.png", dpi=150, bbox_inches='tight')
         plt.close()
         print(" -> Saved: verify_3d_opt_history.png")
+        
+        self.plot_parameter_evolution()
+
+    def plot_parameter_evolution(self):
+        """Generates a 2x2 grid plot showing the evolution of design variable statistics."""
+        if not hasattr(self, 'history') or len(self.history) == 0: return
+
+        print("Generating Parameter Evolution Plot (2x2)...")
+        iters = np.arange(len(self.history))
+        params_to_plot = [p for p in ['t', 'rho', 'E', 'pz'] if f'{p}_mean' in self.history[0]]
+        
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        plt.rcParams.update({'font.size': 8})
+        
+        for idx, pk in enumerate(['t', 'rho', 'E', 'pz']):
+            ax = axes[idx // 2, idx % 2]
+            if pk not in params_to_plot:
+                ax.text(0.5, 0.5, f"Variable '{pk}' not optimized/fixed", ha='center', va='center')
+                continue
+                
+            means = np.array([h[f'{pk}_mean'] for h in self.history])
+            stds  = np.array([h[f'{pk}_std'] for h in self.history])
+            mins  = np.array([h[f'{pk}_min'] for h in self.history])
+            maxs  = np.array([h[f'{pk}_max'] for h in self.history])
+            
+            # Left Axis: Mean, Min, Max
+            ax.plot(iters, means, 'b-', label='Mean', linewidth=2)
+            ax.fill_between(iters, mins, maxs, color='blue', alpha=0.1, label='Min-Max Range')
+            ax.set_xlabel("Iteration")
+            ax.set_ylabel(f"{pk} Value", color='blue')
+            ax.tick_params(axis='y', labelcolor='blue')
+            ax.grid(True, alpha=0.3)
+            
+            # Right Axis: Standard Deviation (Fluctuation/Heterogeneity)
+            ax2 = ax.twinx()
+            ax2.plot(iters, stds, 'r--', label='Std Dev', alpha=0.7)
+            ax2.set_ylabel("Std Dev (Heterogeneity)", color='red')
+            ax2.tick_params(axis='y', labelcolor='red')
+            
+            ax.set_title(f"Evolution of {pk.upper()}", fontsize=10, fontweight='bold')
+            
+            # Legend handling
+            lines, labels = ax.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax.legend(lines + lines2, labels + labels2, loc='upper left', fontsize=7)
+
+        plt.tight_layout()
+        plt.savefig("verify_3d_param_evolution.png", dpi=150)
+        plt.close()
+        print(" -> Saved: verify_3d_param_evolution.png")
 
     def verify(self):
         print("\n" + "="*70)
@@ -549,11 +655,17 @@ class EquivalentSheetModel:
         t_opt = opt_params_h['t'].reshape(Nx_h+1, Ny_h+1)
         z_opt = opt_params_h['z'].reshape(Nx_h+1, Ny_h+1)
         
-        # Calculate comparison metrics
+        # Calculate comparison metrics (Safe correlation handles constant arrays)
+        def safe_corr(a, b):
+            a_flat, b_flat = a.flatten(), b.flatten()
+            if np.std(a_flat) < 1e-12 or np.std(b_flat) < 1e-12:
+                return 1.0 if np.allclose(a_flat, b_flat, atol=1e-5) else 0.0
+            return np.corrcoef(a_flat, b_flat)[0,1]
+
         t_rmse = np.sqrt(np.mean((t_ref - t_opt)**2))
-        t_corr = np.corrcoef(t_ref.flatten(), t_opt.flatten())[0,1]
+        t_corr = safe_corr(t_ref, t_opt)
         z_rmse = np.sqrt(np.mean((z_ref - z_opt)**2))
-        z_corr = np.corrcoef(z_ref.flatten(), z_opt.flatten())[0,1]
+        z_corr = safe_corr(z_ref, z_opt)
         
         fig.suptitle(f"Geometric Parameter Verification (Resolution: {Nx_h}x{Ny_h})\n"
                      f"Thickness: RMSE={t_rmse:.4f}, Corr={t_corr:.4f} | Topography: RMSE={z_rmse:.4f}, Corr={z_corr:.4f}", 
@@ -583,10 +695,13 @@ class EquivalentSheetModel:
         n_modes = len(self.target_eigen['vals'])
         vals_opt, vecs_opt = self.fem_high.solve_eigen(K_opt, M_opt, num_modes=n_modes + 10)
         
-        # Filter Rigid Body (> 0.01 Hz)
+        # Robust Elastic Mode detection using Log-Gap
         freq_opt_all = np.sqrt(np.maximum(np.array(vals_opt), 0.0)) / (2*np.pi)
-        valid_opt = np.where(freq_opt_all > 0.01)[0]
-        s_idx_opt = valid_opt[0] if len(valid_opt) > 0 else 6
+        log_f = np.log(np.maximum(freq_opt_all[:15], 1e-6))
+        gaps = np.concatenate([[0], log_f[1:] - log_f[:-1]])
+        s_idx_opt = np.argmax((freq_opt_all > 1.0) & (gaps > 1.0) | (freq_opt_all > 20.0))
+        
+        print(f" -> Verification: Found first elastic mode at index {s_idx_opt} ({freq_opt_all[s_idx_opt]:.2f} Hz)")
         
         freq_ref = np.sqrt(np.abs(np.array(self.target_eigen['vals']))) / (2*np.pi)
         freq_opt = freq_opt_all[s_idx_opt : s_idx_opt + n_modes]
@@ -772,7 +887,7 @@ class EquivalentSheetModel:
         print("✔ Verification plots saved: verify_3d_*.png")
 
         # 7. Final Interactive Stage (PyVista) - Optional but good for inspection
-        opt_eigen = {'vals': vals_opt[6:6+n_modes], 'modes': vecs_opt[2::6, 6:6+n_modes]}
+        opt_eigen = {'vals': vals_opt[s_idx_opt:s_idx_opt+n_modes], 'modes': vecs_opt[2::6, s_idx_opt:s_idx_opt+n_modes]}
         stage3_visualize_comparison(
             self.fem_high, self.targets, opt_params_h, self.target_params_high,
             opt_eigen=opt_eigen, tgt_eigen=self.target_eigen
@@ -800,18 +915,18 @@ if __name__ == '__main__':
     target_config = {
         'pattern': 'ABC',           'base_t': 1.0, 
         #'bead_t': {'A': 2.0, 'B': 2.5, 'C': 1.5},
-        'pattern_pz': 'TNY',        'bead_pz': {'T': 5.0, 'N': 3.0, 'Y': -2.0},
+        'pattern_pz': 'TNY',        'bead_pz': {'T': 1.0, 'N': 1.0, 'Y': 1.0},
         'base_rho': 7.85e-9,        'base_E': 210000.0,
     }
     
-    model.generate_targets(resolution_high=(50, 20), num_modes_save=5, target_config=target_config)
+    model.generate_targets(resolution_high=(Nx_high, Ny_high), num_modes_save=5, target_config=target_config)
     
     # 4. Optimization Search Space (opt_config)
     opt_config = {
-        't':   {'opt': False, 'init': 1.0,      'min': 0.5,    'max': 5.0},
-        'rho': {'opt': False, 'init': 7.85e-9,   'min': 5e-9,   'max': 1e-8},
-        'E':   {'opt': False, 'init': 210000.0,  'min': 50000,  'max': 300000},
-        'pz':   {'opt': True, 'init': 0.0,  'min': -15.0,  'max': 15.0},
+        't':   {'opt': False, 'init': 1.0,      'min': 0.1,    'max': 10.0},
+        'rho': {'opt': False, 'init': 7.85e-9,   'min': 7.85e-10,   'max': 7.85e-8},
+        'E':   {'opt': False, 'init': 210000.0,  'min': 210000,  'max': 300000.0},
+        'pz':   {'opt': True, 'init': 0.0,  'min': -10.0,  'max': 10.0},
     }
     
     # 5. Full Loss Weights (as previously defined)
@@ -839,13 +954,13 @@ if __name__ == '__main__':
                        use_surface_strain=True,                 
                        use_mass_constraint=True, 
                        mass_tolerance=0.05,
-                       max_iterations=300, 
+                       max_iterations=100, 
                        use_early_stopping=True, 
                        early_stop_patience=100, 
                        early_stop_tol=1e-8,
-                       learning_rate=1.0,
+                       learning_rate=0.5,
                        num_modes_loss=5,
-                       min_bead_width=10.0)
+                       min_bead_width=50.0)
         
         # 6. Verify and Report
         model.verify()
