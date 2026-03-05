@@ -16,14 +16,14 @@ class LoadCase:
 # TWIST LOAD CASE (6-DOF Aligned)
 # ==============================================================================
 class TwistCase(LoadCase):
-    def __init__(self, name, axis='x', value=1.5, mode='angle', weight=1.0):
+    def __init__(self, name, axis='x', value=1.5, mode='angle', weight=1.0, tol=1e-3):
         super().__init__(name, weight)
         self.axis = axis
         self.value = value
         self.mode = mode
+        self.tol = tol
         
     def get_bcs(self, fem):
-        tol = 1e-3
         Lx, Ly = fem.Lx, fem.Ly
         F = jnp.zeros(fem.total_dof)
         fixed_dofs = []
@@ -31,8 +31,8 @@ class TwistCase(LoadCase):
         
         # DOF Mapping: 0:u, 1:v, 2:w, 3:tx, 4:ty, 5:tz
         if self.axis == 'x':
-            left_nodes = jnp.where(fem.node_coords[:, 0] < tol)[0]
-            right_nodes = jnp.where(fem.node_coords[:, 0] > Lx - tol)[0]
+            left_nodes = jnp.where(fem.node_coords[:, 0] < self.tol)[0]
+            right_nodes = jnp.where(fem.node_coords[:, 0] > Lx - self.tol)[0]
             yc = Ly / 2.0
             
             if self.mode == 'angle':
@@ -54,8 +54,8 @@ class TwistCase(LoadCase):
                     fixed_vals.extend([0.0, w_right[i], angle_rad])
                 
         elif self.axis == 'y':
-            bot_nodes = jnp.where(fem.node_coords[:, 1] < tol)[0]
-            top_nodes = jnp.where(fem.node_coords[:, 1] > Ly - tol)[0]
+            bot_nodes = jnp.where(fem.node_coords[:, 1] < self.tol)[0]
+            top_nodes = jnp.where(fem.node_coords[:, 1] > Ly - self.tol)[0]
             xc = Lx / 2.0
             
             if self.mode == 'angle':
@@ -82,22 +82,22 @@ class TwistCase(LoadCase):
 # PURE BENDING LOAD CASE (6-DOF Aligned)
 # ==============================================================================
 class PureBendingCase(LoadCase):
-    def __init__(self, name, axis='y', value=3.0, mode='angle', weight=1.0):
+    def __init__(self, name, axis='y', value=3.0, mode='angle', weight=1.0, tol=1e-3):
         super().__init__(name, weight)
         self.axis = axis
         self.value = value
         self.mode = mode
+        self.tol = tol
         
     def get_bcs(self, fem):
-        tol = 1e-3
         Lx, Ly = fem.Lx, fem.Ly
         F = jnp.zeros(fem.total_dof)
         fixed_dofs = []
         fixed_vals = []
         
         if self.axis == 'y':
-            left_nodes = jnp.where(fem.node_coords[:, 0] < tol)[0]
-            right_nodes = jnp.where(fem.node_coords[:, 0] > Lx - tol)[0]
+            left_nodes = jnp.where(fem.node_coords[:, 0] < self.tol)[0]
+            right_nodes = jnp.where(fem.node_coords[:, 0] > Lx - self.tol)[0]
             if self.mode == 'angle':
                 angle_rad = self.value * np.pi / 180.0
                 for node in left_nodes:
@@ -112,8 +112,8 @@ class PureBendingCase(LoadCase):
                     fixed_vals.extend([0.0, 0.0, -angle_rad])
                 
         elif self.axis == 'x':
-            bot_nodes = jnp.where(fem.node_coords[:, 1] < tol)[0]
-            top_nodes = jnp.where(fem.node_coords[:, 1] > Ly - tol)[0]
+            bot_nodes = jnp.where(fem.node_coords[:, 1] < self.tol)[0]
+            top_nodes = jnp.where(fem.node_coords[:, 1] > Ly - self.tol)[0]
             if self.mode == 'angle':
                 angle_rad = self.value * np.pi / 180.0
                 for node in bot_nodes:

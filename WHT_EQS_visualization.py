@@ -130,7 +130,7 @@ def stage1_visualize_patterns(nx, ny, x_grid, y_grid, t_field, z_field):
         y_grid.flatten(), 
         z_field.flatten()
     ])
-    grid.dimensions = [ny + 1, nx + 1, 1]
+    grid.dimensions = [nx + 1, ny + 1, 1]
     grid["Thickness"] = np.array(t_field).flatten()
     grid["Z-Shape"] = np.array(z_field).flatten()
 
@@ -316,7 +316,7 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
                         grid = pv.StructuredGrid()
                         z_deformed = z + w_mode * scale
                         grid.points = np.column_stack([x, y, z_deformed])
-                        grid.dimensions = [ny + 1, nx + 1, 1]
+                        grid.dimensions = [nx + 1, ny + 1, 1]
                         grid["Mode Shape"] = w_mode
                         
                         p.add_mesh(grid, scalars="Mode Shape", show_edges=True, cmap="coolwarm")
@@ -333,7 +333,7 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
                     grid = pv.StructuredGrid()
                     z_deformed = z + w_mode * scale # Use current scale
                     grid.points = np.column_stack([x, y, z_deformed])
-                    grid.dimensions = [ny + 1, nx + 1, 1]
+                    grid.dimensions = [nx + 1, ny + 1, 1]
                     grid["Mode Shape"] = w_mode
                     
                     # Plot
@@ -435,7 +435,7 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
         grid = pv.StructuredGrid()
         z_deformed = z + w_disp * scale
         grid.points = np.column_stack([x, y, z_deformed])
-        grid.dimensions = [ny + 1, nx + 1, 1]
+        grid.dimensions = [nx + 1, ny + 1, 1]
         grid[field_name] = scalars
         
         # Setup Plotter
@@ -667,7 +667,7 @@ def stage3_visualize_comparison(fem_high, targets, optimized_params, target_para
             # Create structured grid
             grid = pv.StructuredGrid()
             grid.points = np.column_stack([x, y, np.zeros_like(x)])  # Flat geometry
-            grid.dimensions = [ny + 1, nx + 1, 1]
+            grid.dimensions = [nx + 1, ny + 1, 1]
             grid.point_data[field_name] = data
             
             # Add mesh with contour coloring
