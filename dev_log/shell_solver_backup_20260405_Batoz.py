@@ -41,128 +41,94 @@ def recover_stress_tria_membrane(u, nodes, trias, E, nu):
         return B @ u_el
     return vmap(get_element_strain_inner)(jnp.arange(len(trias)))
 
-def _get_B_tria_membrane(nodes):
-    """Constant Strain Triangle (CST) B-matrix for membrane."""
-    x1, y1 = nodes[0,0], nodes[0,1]
-    x2, y2 = nodes[1,0], nodes[1,1]
-    x3, y3 = nodes[2,0], nodes[2,1]
-    detJ = (x2-x1)*(y3-y1) - (x3-x1)*(y2-y1)
-    # b_i = y_j - y_k, c_i = x_k - x_j
-    b1, b2, b3 = y2-y3, y3-y1, y1-y2
-    c1, c2, c3 = x3-x2, x1-x3, x2-x1
-    inv2A = 1.0 / detJ
-    Bm = jnp.array([
-        [b1, 0, b2, 0, b3, 0],
-        [0, c1, 0, c2, 0, c3],
-        [c1, b1, c2, b2, c3, b3]
-    ]) * inv2A
-    return Bm, detJ
-
-def _get_B_dkt(xi, eta, nodes):
-    """
-    DKT (Discrete Kirchhoff Triangle) B-matrix
-    Reference: Batoz (1980) & FEniCS/JuliaFEM DKT implementations.
-    """
-    x1, y1 = nodes[0,0], nodes[0,1]
-    x2, y2 = nodes[1,0], nodes[1,1]
-    x3, y3 = nodes[2,0], nodes[2,1]
-
-    # Jacobian (2 * Area)
-    x21, y21 = x2-x1, y2-y1
-    x31, y31 = x3-x1, y3-y1
-    detJ = x21*y31 - y21*x31
-
-    x23, y23 = x2-x3, y2-y3
-    x31_e, y31_e = x3-x1, y3-y1
-    x12, y12 = x1-x2, y1-y2
-    L23sq = x23**2 + y23**2
-    L31sq = x31_e**2 + y31_e**2
-    L12sq = x12**2 + y12**2
-
-    # DKT coefficients (Batoz Table 1)
-    p4, p5, p6 = -6*x23/L23sq, -6*x31_e/L31sq, -6*x12/L12sq
-    q4, q5, q6 =  3*x23*y23/L23sq,  3*x31_e*y31_e/L31sq,  3*x12*y12/L12sq
-    r4, r5, r6 =  3*y23**2/L23sq,  3*y31_e**2/L31sq,  3*y12**2/L12sq
-    t4, t5, t6 = -6*y23/L23sq, -6*y31_e/L31sq, -6*y12/L12sq
-
-    # Hx Derivatives
+def _get_B_dkt(nodes, xi, eta):
+    """Explicit Batoz (1980) DKT B-matrix (3x9)."""
+    x21 = nodes[1,0]-nodes[0,0]; y21 = nodes[1,1]-nodes[0,1]
+    x32 = nodes[2,0]-nodes[1,0]; y32 = nodes[2,1]-nodes[1,1]
+    x13 = nodes[0,0]-nodes[2,0]; y13 = nodes[0,1]-nodes[2,1]
+    
+    area = 0.5 * jnp.abs(x21*(-y13) - (-x13)*y21)
+    inv2A = 0.5 / area
+    
+    L_sq = jnp.array([x32**2+y32**2, x13**2+y13**2, x21**2+y21**2])
+    invL2 = 1.0 / jnp.where(L_sq < 1e-12, 1e-12, L_sq)
+    
+    p4, p5, p6 = -6*x32*invL2[0], -6*x13*invL2[1], -6*x21*invL2[2]
+    q4, q5, q6 = 3*x32*y32*invL2[0], 3*x13*y13*invL2[1], 3*x21*y21*invL2[2]
+    r4, r5, r6 = 3*y32**2*invL2[0], 3*y13**2*invL2[1], 3*y21**2*invL2[2]
+    t4, t5, t6 = -6*y32*invL2[0], -6*y13*invL2[1], -6*y21*invL2[2]
+    
     Hx_xi = jnp.array([
-         p6*(1.0-2.0*xi) + (p5-p6)*eta,
-         q6*(1.0-2.0*xi) - (q5+q6)*eta,
-        -4.0 + 6.0*(xi+eta) + r6*(1.0-2.0*xi) - eta*(r5+r6),
-        -p6*(1.0-2.0*xi) + eta*(p4+p6),
-         q6*(1.0-2.0*xi) - eta*(q6-q4),
-        -2.0 + 6.0*xi + r6*(1.0-2.0*xi) + eta*(r4-r6),
-        -eta*(p5+p4),
-         eta*(q4-q5),
+        p6*(1-2*xi)+(p5-p6)*eta, 
+        q6*(1-2*xi)-(q5+q6)*eta, 
+        -4+6*(xi+eta)+r6*(1-2*xi)-eta*(r5+r6), 
+        -p6*(1-2*xi)+eta*(p4+p6), 
+        q6*(1-2*xi)-eta*(q6-q4), 
+        -2+6*xi+r6*(1-2*xi)+eta*(r4-r6), 
+        -eta*(p5+p4), 
+        eta*(q4-q5), 
         -eta*(r5-r4)
     ])
-    Hx_et = jnp.array([
-        -p5*(1.0-2.0*eta) - xi*(p6-p5),
-         q5*(1.0-2.0*eta) - xi*(q5+q6),
-        -4.0 + 6.0*(xi+eta) + r5*(1.0-2.0*eta) - xi*(r5+r6),
-         xi*(p4+p6),
-         xi*(q4-q6),
-        -xi*(r6-r4),
-         p5*(1.0-2.0*eta) - xi*(p4+p5),
-         q5*(1.0-2.0*eta) + xi*(q4-q5),
-        -2.0 + 6.0*eta + r5*(1.0-2.0*eta) + xi*(r4-r5)
+    
+    Hx_eta = jnp.array([
+        -p5*(1-2*eta)-xi*(p6-p5), 
+        q5*(1-2*eta)-xi*(q5+q6), 
+        -4+6*(xi+eta)+r5*(1-2*eta)-xi*(r5+r6), 
+        xi*(p4+p6), 
+        xi*(q4-q6), 
+        -xi*(r6-r4), 
+        p5*(1-2*eta)-xi*(p4+p5), 
+        q5*(1-2*eta)+xi*(q4-q5), 
+        -2+6*eta+r5*(1-2*eta)+xi*(r4-r5)
     ])
-
-    # Hy Derivatives
+    
     Hy_xi = jnp.array([
-         t6*(1.0-2.0*xi) + eta*(t5-t6),
-         1.0 + r6*(1.0-2.0*xi) - eta*(r5+r6),
-        -q6*(1.0-2.0*xi) + eta*(q5+q6),
-        -t6*(1.0-2.0*xi) + eta*(t4+t6),
-        -1.0 + r6*(1.0-2.0*xi) + eta*(r4-r6),
-        -q6*(1.0-2.0*xi) - eta*(q4-q6),
-        -eta*(t4+t5),
-         eta*(r4-r5),
+        t6*(1-2*xi)+eta*(t5-t6), 
+        1+r6*(1-2*xi)-eta*(r5+r6), 
+        -q6*(1-2*xi)+eta*(q5+q6), 
+        -t6*(1-2*xi)+eta*(t4+t6), 
+        -1+r6*(1-2*xi)+eta*(r4-r6), 
+        -q6*(1-2*xi)-eta*(q4-q6), 
+        -eta*(t4+t5), 
+        eta*(r4-r5), 
         -eta*(q4-q5)
     ])
-    Hy_et = jnp.array([
-        -t5*(1.0-2.0*eta) - xi*(t6-t5),
-         1.0 + r5*(1.0-2.0*eta) - xi*(r5+r6),
-        -q5*(1.0-2.0*eta) + xi*(q5+q6),
-         xi*(t4+t6),
-         xi*(r4-r6),
-        -xi*(q4-q6),
-         t5*(1.0-2.0*eta) - xi*(t4+t5),
-        -1.0 + r5*(1.0-2.0*eta) + xi*(r4-r5),
-        -q5*(1.0-2.0*eta) - xi*(q4-q5)
+    
+    Hy_eta = jnp.array([
+        -t5*(1-2*eta)-xi*(t6-t5), 
+        1+r5*(1-2*eta)-xi*(r5+r6), 
+        -q5*(1-2*eta)+xi*(q5+q6), 
+        xi*(t4+t6), 
+        xi*(r4-r6), 
+        -xi*(q4-q6), 
+        t5*(1-2*eta)-xi*(t4+t5), 
+        -1+r5*(1-2*eta)+xi*(r4-r5), 
+        -q5*(1-2*eta)-xi*(q4-q5)
     ])
-
-    invJ = 1.0 / detJ
-    B = jnp.zeros((3, 9))
-    # Curvature Row 0: kappa_x = beta_x,x
-    B = B.at[0].set( invJ * (y31*Hx_xi - y21*Hx_et) )
-    # Curvature Row 1: kappa_y = beta_y,y
-    B = B.at[1].set( invJ * (-x31*Hy_xi + x21*Hy_et) )
-    # Curvature Row 2: 2kxy = beta_x,y + beta_y,x
-    B = B.at[2].set( invJ * (-x31*Hx_xi + x21*Hx_et + y31*Hy_xi - y21*Hy_et) )
-    return B
+    
+    B1 = inv2A * ((-y13)*Hx_xi + y21*Hx_eta)
+    B2 = inv2A * (x13*Hy_xi + (-x21)*Hy_eta)
+    B3 = inv2A * (x13*Hx_xi + (-x21)*Hx_eta + (-y13)*Hy_xi + y21*Hy_eta)
+    
+    return jnp.stack([B1, B2, B3])
 
 def recover_curvature_tria_bending(u, nodes, trias, E, nu, t):
-    """Recover curvature from local T3 displacements."""
-    def get_curv(idx):
+    """Batoz DKT curvature recovery."""
+    def get_curvature(idx):
         ix = trias[idx]
-        t_nodes = nodes[ix].astype(jnp.float64)
+        tri_nodes = nodes[ix]
+        u_all = u.reshape(-1, 6)[ix]
+        u_b = u_all[:, 2:5] # w, tx, ty
         
-        # Local system: w,x = -phiy, w,y = phix
-        u_el = u.reshape(-1, 6)[ix]
-        # Batoz: u = [w1, thx1, thy1, w2, thx2, thy2, w3, thx3, thy3]
-        # Slopes: thx = w,x = -phiy, thy = w,y = phix
-        udkt = jnp.array([
-            u_el[0, 2], -u_el[0, 4], u_el[0, 3],
-            u_el[1, 2], -u_el[1, 4], u_el[1, 3],
-            u_el[2, 2], -u_el[2, 4], u_el[2, 3]
-        ])
+        # Mapping: Batoz's [w,Beta_x,Beta_y] -> our [w,theta_x,theta_y]
+        Tnode = jnp.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]])
+        T9 = jsl.block_diag(Tnode, Tnode, Tnode)
         
-        B = _get_B_dkt(1.0/3.0, 1.0/3.0, t_nodes)
-        return B @ udkt
-    
-    return vmap(get_curv)(jnp.arange(len(trias)))
+        # Center of triangle (1/3, 1/3)
+        B = _get_B_dkt(tri_nodes, 1./3., 1./3.) @ T9
+        kappa = B @ u_b.flatten()
+        return -kappa # Kirchhoff convention
+    return vmap(get_curvature)(jnp.arange(len(trias)))
 
 def recover_curvature_quad_bending(u, nodes, quads, E, nu, t):
     """Q4 Mindlin curvature recovery."""
@@ -193,9 +159,9 @@ def recover_curvature_quad_bending(u, nodes, quads, E, nu, t):
         tx_l = tx_g * e1[0] + ty_g * e1[1]
         ty_l = tx_g * e2[0] + ty_g * e2[1]
         
-        kx = -jnp.dot(dn_dx, ty_l)
-        ky = jnp.dot(dn_dy, tx_l)
-        kxy = -jnp.dot(dn_dy, ty_l) + jnp.dot(dn_dx, tx_l)
+        kx = jnp.dot(dn_dx, ty_l)
+        ky = -jnp.dot(dn_dy, tx_l)
+        kxy = jnp.dot(dn_dy, ty_l) - jnp.dot(dn_dx, tx_l)
         return jnp.array([kx, ky, kxy])
     return vmap(get_curvature)(jnp.arange(len(quads)))
 
@@ -251,7 +217,7 @@ def safe_eigh_bwd(res, g):
     grad_A_vals = jnp.einsum('k,ik,jk->ij', g_vals, vecs, vecs)
     diff = vals[:, None] - vals[None, :]
     F = jnp.where(jnp.abs(diff) < 1e-9, jnp.inf, 1.0 / diff)
-    F = jnp.where(jnp.isinf(F), 0.0, F).at[jnp.diag_indices(vecs.shape[0])].set(0.0)
+    F = jnp.where(jnp.isinf(F), 0.0, F).at[jnp.diag_indices_from(A)].set(0.0)
     P = F * (vecs.T @ g_vecs)
     grad_A_vecs = vecs @ P @ vecs.T
     total = 0.5 * (grad_A_vals + grad_A_vecs + (grad_A_vals + grad_A_vecs).T)
@@ -328,54 +294,45 @@ def compute_q4_local(E, t, nu, rho, a, b):
     return K_local, M_local
 
 def compute_tria3_local(E, t, nu, rho, x2d, y2d):
-    """Complete 6-DOF T3 Shell Element (CST Membrane + DKT Bending)."""
+    area = 0.5*jnp.abs((x2d[1]-x2d[0])*(y2d[2]-y2d[0])-(x2d[2]-x2d[0])*(y2d[1]-y2d[0]))
     nodes = jnp.stack([x2d, y2d], axis=1)
+    C_mem = (E*t/(1-nu**2)) * jnp.array([[1,nu,0],[nu,1,0],[0,0,(1-nu)/2]])
     
-    # 1. Membrane Part (CST)
-    Bm, detJ_m = _get_B_tria_membrane(nodes)
-    area = jnp.abs(detJ_m) * 0.5
-    Dm = (E*t/(1-nu**2)) * jnp.array([[1,nu,0],[nu,1,0],[0,0,(1-nu)/2]])
-    Km = (Bm.T @ Dm @ Bm) * area
+    y23, y31, y12 = y2d[1]-y2d[2], y2d[2]-y2d[1], y2d[0]-y2d[1]
+    x32, x13, x21 = x2d[2]-x2d[1], x2d[0]-x2d[2], x2d[1]-x2d[0]
+    B_m = (0.5/area) * jnp.array([
+        [y23,0, y31,0, y12,0], 
+        [0,x32, 0,x13, 0,x21], 
+        [x32,y23, x13,y31, x21,y12]
+    ])
+    K_m = area * (B_m.T @ C_mem @ B_m)
     
-    # 2. Bending Part (DKT)
-    Db = (E*(t**3)/(12*(1-nu**2))) * jnp.array([[1,nu,0],[nu,1,0],[0,0,(1-nu)/2]])
-    def get_Kb_at(xi, eta, weight):
-        B = _get_B_dkt(xi, eta, nodes)
-        # Transform local [w, phix, phiy] to DKT [w, thx, thy]
-        T = jnp.zeros((9,9))
-        for i in range(3):
-            T = T.at[3*i, 3*i].set(1.0)
-            T = T.at[3*i+1, 3*i+2].set(-1.0) # thx = -phiy
-            T = T.at[3*i+2, 3*i+1].set(1.0)  # thy = phix
-        BT = B @ T
-        return (BT.T @ Db @ BT) * area * weight
-
-    pts = jnp.array([[1/6, 1/6], [2/3, 1/6], [1/6, 2/3]])
-    ws = jnp.array([1/3, 1/3, 1/3])
-    Kb_total = jnp.zeros((9,9))
-    # Sum over 3 integration points
-    Kb_total += get_Kb_at(pts[0,0], pts[0,1], ws[0])
-    Kb_total += get_Kb_at(pts[1,0], pts[1,1], ws[1])
-    Kb_total += get_Kb_at(pts[2,0], pts[2,1], ws[2])
+    D_bend = (E*t**3/(12*(1-nu**2))) * jnp.array([[1,nu,0],[nu,1,0],[0,0,(1-nu)/2]])
+    Tnode = jnp.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]])
+    T9 = jsl.block_diag(Tnode, Tnode, Tnode)
     
-    # 3. Assemble Local 18x18
-    K_local = jnp.zeros((18, 18))
-    mem_idx = jnp.array([0,1, 6,7, 12,13])
-    bend_idx = jnp.array([2,3,4, 8,9,10, 14,15,16])
-    drill_idx = jnp.array([5,11,17])
+    pts = jnp.array([[2/3, 1/6], [1/6, 2/3], [1/6, 1/6]])
+    w_gp = 1.0/6.0
+    K_b = jnp.zeros((9,9))
+    for i in range(3):
+        B = _get_B_dkt(nodes, pts[i,0], pts[i,1]) @ T9
+        K_b += (w_gp * 2*area) * (B.T @ D_bend @ B)
+        
+    K_local = jnp.zeros((18,18))
+    mem_id = jnp.array([0,1, 6,7, 12,13])
+    bend_id = jnp.array([2,3,4, 8,9,10, 14,15,16])
+    drill_id = jnp.array([5,11,17])
     
-    K_local = K_local.at[jnp.ix_(mem_idx, mem_idx)].set(Km)
-    K_local = K_local.at[jnp.ix_(bend_idx, bend_idx)].set(Kb_total)
-    # Restore standard drilling stabilization - the previous 600x error was transformation-based
-    K_local = K_local.at[drill_idx, drill_idx].add(E * t * area * 1e-6)
+    K_local = K_local.at[jnp.ix_(mem_id, mem_id)].set(K_m)
+    K_local = K_local.at[jnp.ix_(bend_id, bend_id)].set(K_b)
+    K_local = K_local.at[drill_id, drill_id].add(E*t*area*1e-4)
     
-    # 4. Mass Matrix
-    m_node = rho * area * t / 3.0
-    I_rot = m_node * (t**2) / 12.0
-    I_drill = m_node * area / 12.0 * 0.01
+    m_node = rho*area*t/3.0
+    I_rot = m_node*(t**2)/12.0
+    I_drill = m_node*area/12.0*0.01
+    
     m_vec = jnp.array([m_node, m_node, m_node, I_rot, I_rot, I_drill])
     M_local = jnp.diag(jnp.tile(m_vec, 3))
-    
     return K_local, M_local
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -471,32 +428,7 @@ class ShellFEM:
             K_g = K_g.at[Gi, Gj].add(Kt.flatten())
             M_g = M_g.at[Gi, Gj].add(Mt.flatten())
             
-        if not sparse:
-            return K_g, M_g
-        else:
-            # Sparse assembly using scipy.sparse (CPU) for large models
-            from scipy.sparse import coo_matrix
-            
-            rows, cols, k_vals, m_vals = [], [], [], []
-            if len(self.quads) > 0:
-                rows.append(np.array(self.quad_dof_idx[:, jnp.repeat(jnp.arange(24), 24)].flatten()))
-                cols.append(np.array(self.quad_dof_idx[:, jnp.tile(jnp.arange(24), 24)].flatten()))
-                k_vals.append(np.array(Kq).flatten())
-                m_vals.append(np.array(Mq).flatten())
-            if len(self.trias) > 0:
-                rows.append(np.array(self.tria_dof_idx[:, jnp.repeat(jnp.arange(18), 18)].flatten()))
-                cols.append(np.array(self.tria_dof_idx[:, jnp.tile(jnp.arange(18), 18)].flatten()))
-                k_vals.append(np.array(Kt).flatten())
-                m_vals.append(np.array(Mt).flatten())
-            
-            R = np.concatenate(rows); C = np.concatenate(cols)
-            KV = np.concatenate(k_vals); MV = np.concatenate(m_vals)
-            K_sparse = coo_matrix((KV, (R, C)), shape=(self.total_dof, self.total_dof)).tocsr()
-            M_sparse = coo_matrix((MV, (R, C)), shape=(self.total_dof, self.total_dof)).tocsr()
-            return K_sparse, M_sparse
-
-    def assemble_sparse(self, params):
-        return self.assemble(params, sparse=True)
+        return K_g, M_g
 
     def solve_eigen(self, K, M, num_modes=10):
         m_diag = jnp.maximum(jnp.diag(M), 1e-15)
@@ -506,39 +438,10 @@ class ShellFEM:
         vals, vecs = safe_eigh(A)
         return jnp.maximum(vals, 0.0)[:num_modes], (vecs * m_inv_sqrt[:,None])[:, :num_modes]
 
-    def solve_static(self, params, F, prescribed_dofs, prescribed_vals, sparse=False):
-        K, _ = self.assemble(params, sparse=sparse)
+    def solve_static(self, params, F, prescribed_dofs, prescribed_vals):
+        K, _ = self.assemble(params)
         free_dofs = jnp.setdiff1d(jnp.arange(self.total_dof), prescribed_dofs)
-        if sparse:
-            return self.solve_static_sparse(K, F, free_dofs, prescribed_dofs, prescribed_vals)
-        else:
-            return self.solve_static_partitioned(K, F, free_dofs, prescribed_dofs, prescribed_vals)
-
-    def solve_static_sparse(self, K_s, F, free_dofs, prescribed_dofs, prescribed_vals):
-        """Solve static problem using scipy.sparse.linalg.spsolve."""
-        from scipy.sparse.linalg import spsolve
-        # Indices must be numpy for scipy
-        fd = np.array(free_dofs)
-        pd = np.array(prescribed_dofs)
-        pv = np.array(prescribed_vals)
-        
-        K_ff = K_s[fd, :][:, fd]
-        K_fp = K_s[fd, :][:, pd]
-        rhs = np.array(F)[fd] - K_fp.dot(pv)
-        
-        u_f = spsolve(K_ff, rhs)
-        u = np.zeros(self.total_dof)
-        u[fd] = u_f
-        u[pd] = pv
-        return jnp.array(u)
-
-    def solve_eigen_sparse(self, K_s, M_s, num_modes=10):
-        """Solve generalized eigen problem using scipy.sparse.linalg.eigsh."""
-        from scipy.sparse.linalg import eigsh
-        # Shift-invert for reliability
-        vals, vecs = eigsh(K_s, k=num_modes, M=M_s, which='LM', sigma=1.0, tol=1e-5)
-        idx = np.argsort(vals)
-        return jnp.array(vals[idx]), jnp.array(vecs[:, idx])
+        return self.solve_static_partitioned(K, F, free_dofs, prescribed_dofs, prescribed_vals)
 
     def compute_field_results(self, u, params, K=None):
         E_nodes = params.get('E', 210000.0)

@@ -135,16 +135,21 @@ def stage1_visualize_patterns(nx, ny, x_grid, y_grid, t_field, z_field):
     grid["Z-Shape"] = np.array(z_field).flatten()
 
     # Interactive menu loop
+    import os
     while True:
-        print("\n" + "="*70)
-        print(" [STAGE 1] PRE-GENERATION PATTERN VERIFICATION")
-        print("="*70)
-        print(" Inspect bead patterns before running FEM analysis")
-        print(" 1: Visualize Thickness Pattern (Bead Cross-Section)")
-        print(" 2: Visualize Z-Shape Pattern (Topography Height)")
-        print(" 0: Cancel / Continue to Ground Truth Generation (or press Enter)")
-        print("="*70)
-        choice = input(">> Your choice [0-2]: ").strip()
+        if os.environ.get("NON_INTERACTIVE"):
+            print("[NON-INTERACTIVE] Skipping Stage 1 Pattern Verification.")
+            choice = '0'
+        else:
+            print("\n" + "="*70)
+            print(" [STAGE 1] PRE-GENERATION PATTERN VERIFICATION")
+            print("="*70)
+            print(" Inspect bead patterns before running FEM analysis")
+            print(" 1: Visualize Thickness Pattern (Bead Cross-Section)")
+            print(" 2: Visualize Z-Shape Pattern (Topography Height)")
+            print(" 0: Cancel / Continue to Ground Truth Generation (or press Enter)")
+            print("="*70)
+            choice = input(">> Your choice [0-2]: ").strip()
         
         # Exit on 0 or empty input
         if not choice or choice == '0':
@@ -193,7 +198,7 @@ def stage1_visualize_patterns(nx, ny, x_grid, y_grid, t_field, z_field):
             )
             
         else:
-            print("⚠ Invalid choice. Please enter 1, 2, or 0.")
+            print("[WARNING] Invalid choice. Please enter 1, 2, or 0.")
             continue
         
         # Show visualization window (blocks until user closes it)
@@ -258,23 +263,33 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
     scale = 5.0
     
     # Interactive menu loop
+    import os
     while True:
-        print("\n" + "="*70)
-        print(" [STAGE 2] GROUND TRUTH ANALYSIS RESULTS VIEWER")
-        print("="*70)
-        print(" View deformed shapes and contours for each load case")
+        if os.environ.get("NON_INTERACTIVE"):
+            print("[NON-INTERACTIVE] Skipping Stage 2 Results Viewer.")
+            choice = '0'
+        else:
+            print("\n" + "="*70)
+            print(" [STAGE 2] GROUND TRUTH ANALYSIS RESULTS VIEWER")
+            print("="*70)
+            print(" View deformed shapes and contours for each load case")
+            
+            # List all available load cases
+            for idx, tgt in enumerate(targets):
+                print(f" {idx+1}: {tgt['case_name']}")
+            
+            print(f" S: Set Deformation Scale (Current: {scale:.1f}x)")
+            if eigen_data:
+                print(" M: View Eigenmodes (Vibration Analysis)")
+            print(" 0: Cancel / Continue to Optimization (or press Enter)")
+            print("="*70)
+            choice = input(">> Select choice: ").strip()
         
-        # List all available load cases
-        for idx, tgt in enumerate(targets):
-            print(f" {idx+1}: {tgt['case_name']}")
-        
-        print(f" S: Set Deformation Scale (Current: {scale:.1f}x)")
-        if eigen_data:
-            print(" M: View Eigenmodes (Vibration Analysis)")
-        print(" 0: Cancel / Continue to Optimization (or press Enter)")
-        print("="*70)
-        choice = input(">> Select choice: ").strip()
-        
+        # [CRITICAL FIX] Exit immediately on 0 or empty input (Proceed to Optimization)
+        if not choice or choice == '0':
+            print("[OK] Proceeding to optimization...")
+            break
+            
         # Handle Eigenmode Visualization
         if choice.lower() == 'm' and eigen_data:
             vals = eigen_data['vals']
@@ -343,9 +358,9 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
                     p.add_text(f"Frequency: {freq_hz:.2f} Hz", position='upper_right', font_size=10, color='black')
                     p.show()
                 else:
-                    print("⚠ Invalid mode number.")
+                    print("[WARNING] Invalid mode number.")
             except ValueError:
-                print("⚠ Invalid input.")
+                print("[WARNING] Invalid input.")
             continue
         
         # Handle Scale Change
@@ -355,23 +370,18 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
                 scale = new_scale
                 print(f"[OK] Scale updated to {scale}x")
             except ValueError:
-                print("⚠ Invalid input. Scale unchanged.")
+                print("[WARNING] Invalid input. Scale unchanged.")
             continue
 
-        # Exit on 0 or empty input
-        if not choice or choice == '0':
-            print("[OK] Proceeding to optimization...")
-            break
-            
-        # Parse and validate user input
+        # Parse and validate user input for specific load case
         try:
             sel_idx = int(choice) - 1
             if sel_idx < 0 or sel_idx >= len(targets):
-                print("⚠ Invalid case number. Please try again.")
+                print("[WARNING] Invalid case number. Please try again.")
                 continue
             tgt = targets[sel_idx]
         except ValueError:
-            print("⚠ Invalid input. Please enter a number or 'S'.")
+            print("[WARNING] Invalid input. Please enter a number or 'S'.")
             continue
         
         # Sub-menu for Result Type
@@ -388,7 +398,7 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
             type_choice = 'A'
             
         if type_choice not in ['A', 'B', 'C']:
-            print("⚠ Invalid type. Defaulting to Displacement (A).")
+            print("[WARNING] Invalid type. Defaulting to Displacement (A).")
             type_choice = 'A'
 
         # Select Data Field
@@ -576,19 +586,24 @@ def stage3_visualize_comparison(fem_high, targets, optimized_params, target_para
     y = np.array(fem_high.node_coords[:, 1])
     
     # Interactive menu loop
+    import os
     while True:
-        print("\n" + "="*70)
-        print(" [STAGE 3] POST-OPTIMIZATION COMPARISON VIEWER")
-        print("="*70)
-        print(" Compare target and optimized parameters side-by-side")
-        print(" 1: Compare Thickness Fields (Target vs Optimized)")
-        print(" 2: Compare Z-Shape Fields (Target vs Optimized)")
-        if opt_eigen and tgt_eigen:
-            print(" 3: Compare Eigenmodes (Frequencies & Shapes)")
-        print(" H: View Optimization History (Convergence Plot)")
-        print(" 0: Cancel / Exit Program (or press Enter)")
-        print("="*70)
-        choice = input(">> Your choice [0-3/H]: ").strip().upper()
+        if os.environ.get("NON_INTERACTIVE"):
+            print("[NON-INTERACTIVE] Skipping Stage 3 Comparison Viewer.")
+            choice = '0'
+        else:
+            print("\n" + "="*70)
+            print(" [STAGE 3] POST-OPTIMIZATION COMPARISON VIEWER")
+            print("="*70)
+            print(" Compare target and optimized parameters side-by-side")
+            print(" 1: Compare Thickness Fields (Target vs Optimized)")
+            print(" 2: Compare Z-Shape Fields (Target vs Optimized)")
+            if opt_eigen and tgt_eigen:
+                print(" 3: Compare Eigenmodes (Frequencies & Shapes)")
+            print(" H: View Optimization History (Convergence Plot)")
+            print(" 0: Cancel / Exit Program (or press Enter)")
+            print("="*70)
+            choice = input(">> Your choice [0-3/H]: ").strip().upper()
         
         # Exit on 0 or empty input
         if not choice or choice == '0':
@@ -601,7 +616,7 @@ def stage3_visualize_comparison(fem_high, targets, optimized_params, target_para
                 print(f" -> Opening {history_file}...")
                 os.startfile(history_file) # Windows-specific as per system requirement
             else:
-                print(f" ⚠ History file not found: {history_file}")
+                print(f" [WARNING] History file not found: {history_file}")
             continue
 
         # Setup split-screen plotter (1 row, 2 columns)
@@ -640,10 +655,10 @@ def stage3_visualize_comparison(fem_high, targets, optimized_params, target_para
                 units = "Rel"
                 cmap = "coolwarm"
             except:
-                print("⚠ Invalid mode selection.")
+                print("[WARNING] Invalid mode selection.")
                 continue
         else:
-            print("⚠ Invalid choice.")
+            print("[WARNING] Invalid choice.")
             continue
 
         # Helper function to add mesh to specific subplot

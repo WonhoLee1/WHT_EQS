@@ -64,11 +64,11 @@ class EquivalentSheetModel:
         if os.path.exists(cache_file):
             print(f"\n[CACHE DETECTED] Found existing Ground Truth data: {cache_file}")
             while True:
-                choice = input("Do you want to load from cache? [Y/N]: ").strip().upper()
+                choice = input("Do you want to load from cache? [y/N]: ").strip().upper()
                 if choice == 'Y':
                     use_cache = True
                     break
-                elif choice == 'N':
+                elif choice in ('N', ''):
                     use_cache = False
                     break
         
