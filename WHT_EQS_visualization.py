@@ -165,6 +165,7 @@ def stage1_visualize_patterns(nx, ny, x_grid, y_grid, t_field, z_field):
                 grid, 
                 scalars="Thickness", 
                 show_edges=True, 
+                edge_color='#555555',
                 cmap="viridis", 
                 scalar_bar_args={
                     'title': "Thickness (mm)", 
@@ -184,6 +185,7 @@ def stage1_visualize_patterns(nx, ny, x_grid, y_grid, t_field, z_field):
                 grid, 
                 scalars="Z-Shape", 
                 show_edges=True, 
+                edge_color='#555555',
                 cmap="plasma", 
                 scalar_bar_args={
                     'title': "Z-Height (mm)", 
@@ -257,7 +259,10 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
     nx, ny = fem.nx, fem.ny
     x = np.array(fem.node_coords[:, 0])
     y = np.array(fem.node_coords[:, 1])
-    z = np.array(params['z']).flatten()
+    # [CRITICAL FIX] Combine Base Mesh Z (Tray Height) with Topography Pattern
+    z_base = np.array(fem.node_coords[:, 2]).flatten()
+    z_pattern = np.array(params['z']).flatten()
+    z = z_base + z_pattern
     
     # Default deformation scale
     scale = 5.0
@@ -334,7 +339,7 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
                         grid.dimensions = [nx + 1, ny + 1, 1]
                         grid["Mode Shape"] = w_mode
                         
-                        p.add_mesh(grid, scalars="Mode Shape", show_edges=True, cmap="coolwarm")
+                        p.add_mesh(grid, scalars="Mode Shape", show_edges=True, edge_color='#555555', cmap="coolwarm")
                         p.add_text(f"Mode {i+1}: {freq_hz:.2f} Hz", position='upper_right', font_size=8)
                         
                     p.link_views()
@@ -354,7 +359,7 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
                     # Plot
                     title = f"Mode {m_idx+1}: {freq_hz:.2f} Hz (Scale: {scale}x)"
                     p = setup_plotter(title)
-                    p.add_mesh(grid, scalars="Mode Shape", show_edges=True, cmap="coolwarm")
+                    p.add_mesh(grid, scalars="Mode Shape", show_edges=True, edge_color='#555555', cmap="coolwarm")
                     p.add_text(f"Frequency: {freq_hz:.2f} Hz", position='upper_right', font_size=10, color='black')
                     p.show()
                 else:
@@ -456,6 +461,7 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
             grid, 
             scalars=field_name, 
             show_edges=True, 
+            edge_color='#555555',
             cmap=cmap, 
             scalar_bar_args={
                 'title': field_name, 
@@ -541,7 +547,7 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
 # STAGE 3: POST-OPTIMIZATION COMPARISON
 # ==============================================================================
 
-def stage3_visualize_comparison(fem_high, targets, optimized_params, target_params, opt_eigen=None, tgt_eigen=None, history_file="verify_3d_opt_history.png"):
+def stage3_visualize_comparison(fem_target, fem_optimized, targets, optimized_params, target_params, opt_eigen=None, tgt_eigen=None, history_file="verify_3d_opt_history.png"):
     """
     [STAGE 3] Interactive side-by-side comparison of target vs optimized results.
     
@@ -553,18 +559,16 @@ def stage3_visualize_comparison(fem_high, targets, optimized_params, target_para
     
     Parameters:
     -----------
-    fem_high : PlateFEM
-        High-resolution FEM instance (for mesh coordinates)
+    fem_target : PlateFEM
+        High-resolution FEM instance for the target results.
+    fem_optimized : PlateFEM
+        FEM instance used during optimization (often lower resolution).
     targets : list of dict
-        Target results (not used in current version but available for extension)
+        Target results metadata.
     optimized_params : dict
-        Optimized parameter fields:
-        - 't': Thickness field (interpolated to high-res mesh)
-        - 'z': Topography field
-        - 'rho': Density field
-        - 'E': Young's modulus field
+        Optimized parameter fields (matched to fem_optimized resolution).
     target_params : dict
-        Ground truth parameter fields (same structure as optimized_params)
+        Ground truth parameter fields (matched to fem_target resolution).
     opt_eigen, tgt_eigen : dict, optional
         Eigenvalue data for comparison
     history_file : str, optional
@@ -579,13 +583,7 @@ def stage3_visualize_comparison(fem_high, targets, optimized_params, target_para
         H: View Optimization History (Convergence Plot)
         0 or Enter: Exit program
     """
-    import os
-    # Extract mesh coordinates
-    nx, ny = fem_high.nx, fem_high.ny
-    x = np.array(fem_high.node_coords[:, 0])
-    y = np.array(fem_high.node_coords[:, 1])
-    
-    # Interactive menu loop
+    # Interactive Menu Loop
     import os
     while True:
         if os.environ.get("NON_INTERACTIVE"):
@@ -627,14 +625,15 @@ def stage3_visualize_comparison(fem_high, targets, optimized_params, target_para
         
         # Select data field based on user choice
         if choice == '1':
-            data_target = np.array(target_params['t']).flatten()
-            data_optimized = np.array(optimized_params['t']).flatten()
+            data_target = np.array(target_params.get('t', 1.0)).flatten()
+            data_optimized = np.array(optimized_params.get('t', 1.0)).flatten()
             field_name = "Thickness"
             units = "mm"
             cmap = "viridis"
         elif choice == '2':
-            data_target = np.array(target_params['z']).flatten()
-            data_optimized = np.array(optimized_params['z']).flatten()
+            # Handle both 'z' and 'pz' naming conventions
+            data_target = np.array(target_params.get('z', target_params.get('pz', 0.0))).flatten()
+            data_optimized = np.array(optimized_params.get('z', optimized_params.get('pz', 0.0))).flatten()
             field_name = "Z-Height"
             units = "mm"
             cmap = "viridis"
@@ -662,59 +661,68 @@ def stage3_visualize_comparison(fem_high, targets, optimized_params, target_para
             continue
 
         # Helper function to add mesh to specific subplot
-        def add_comparison_mesh(plotter, col_idx, data, title):
+        def add_comparison_mesh(plotter, col_idx, data, fem, params, field_name, title, eigen_mode=None):
             """
-            Add mesh to subplot at specified column index.
-            
-            Parameters:
-            -----------
-            plotter : pyvista.Plotter
-                Main plotter instance
-            col_idx : int
-                Column index (0=left, 1=right)
-            data : ndarray
-                Scalar field data to visualize
-            title : str
-                Subplot title ("TARGET" or "OPTIMIZED")
+            Add mesh to subplot with resolution-independent logic.
             """
-            plotter.subplot(0, col_idx)  # Select subplot (row=0, col=col_idx)
+            plotter.subplot(0, col_idx)  # Select subplot
             
-            # Create structured grid
+            x = np.array(fem.node_coords[:, 0])
+            y = np.array(fem.node_coords[:, 1])
+            nx, ny = fem.nx, fem.ny
+            
+            # Base Tray Z
+            z_base = np.array(fem.node_coords[:, 2]).flatten()
+            
+            # Determine 3D Point Coordinates
+            if field_name == "Z-Height":
+                z_full = z_base + data
+            elif eigen_mode is not None:
+                # 3D Deformation for Mode Shape
+                scale = 50.0 # Amplitude for visualization
+                z_full = z_base + data * scale
+            else:
+                z_full = z_base
+                
             grid = pv.StructuredGrid()
-            grid.points = np.column_stack([x, y, np.zeros_like(x)])  # Flat geometry
+            grid.points = np.column_stack([x, y, z_full])
             grid.dimensions = [nx + 1, ny + 1, 1]
             grid.point_data[field_name] = data
             
-            # Add mesh with contour coloring
+            # Use appropriate colormap
+            cmap_local = "coolwarm" if eigen_mode is not None else "viridis"
+            cbar_title = f"{field_name} (Rel)" if eigen_mode is not None else f"{field_name} ({units})"
+
             plotter.add_mesh(
                 grid, 
                 scalars=field_name, 
                 show_edges=True, 
-                cmap=cmap, # Use dynamic cmap (viridis or coolwarm)
+                edge_color='#555555',
+                cmap=cmap_local,
                 scalar_bar_args={
-                    'label_font_size': 9, 
-                    'title_font_size': 10,
-                    'title': f"{field_name} ({units})"
+                    'label_font_size': 8, 
+                    'title_font_size': 9,
+                    'title': cbar_title
                 }
             )
             
-            # Add subplot title
-            plotter.add_text(
-                title, 
-                position='upper_edge', 
-                font_size=10, 
-                color='black'
-            )
+            plotter.add_text(title, position='upper_edge', font_size=10, color='black')
 
         # Add both meshes (left=target, right=optimized)
-        title_l = "TARGET"
-        title_r = "OPTIMIZED"
+        title_l = "TARGET [High-Res]"
+        title_r = "OPTIMIZED [Low-Res]"
+        
+        m_num = None
         if choice == '3':
+            m_num = m_idx + 1
             title_l += f" ({f_target:.2f} Hz)"
             title_r += f" ({f_opt:.2f} Hz)"
-            
-        add_comparison_mesh(p, 0, data_target, title_l)
-        add_comparison_mesh(p, 1, data_optimized, title_r)
+
+        # Left: Target
+        add_comparison_mesh(p, 0, data_target, fem_target, target_params, field_name, title_l, eigen_mode=m_num)
+        
+        # Right: Optimized
+        add_comparison_mesh(p, 1, data_optimized, fem_optimized, optimized_params, field_name, title_r, eigen_mode=m_num)
         
         # Link camera views for synchronized rotation/zoom
         p.link_views()

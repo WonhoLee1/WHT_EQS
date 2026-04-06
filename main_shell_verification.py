@@ -14,10 +14,11 @@ import pickle
 
 # Import our modular components
 from ShellFemSolver.shell_solver import ShellFEM
-from ShellFemSolver.mesh_utils import generate_rect_mesh_quads
+from ShellFemSolver.mesh_utils import generate_rect_mesh_quads, generate_tray_mesh_quads
 
 def PlateFEM(Lx, Ly, nx, ny):
-    nodes, elements = generate_rect_mesh_quads(Lx, Ly, nx, ny)
+    # 'vertical' 또는 'sloped' 모드를 선택할 수 있습니다.
+    nodes, elements = generate_tray_mesh_quads(Lx, Ly, wall_width=50.0, wall_height=50.0, nx=nx, ny=ny, mode='vertical')
     fem = ShellFEM(nodes, elements)
     fem.Lx, fem.Ly, fem.nx, fem.ny = Lx, Ly, nx, ny
     return fem
@@ -32,7 +33,7 @@ from WHT_EQS_visualization import (
 # Mesh Settings
 Lx, Ly = 1450.0, 850.0
 Nx_high, Ny_high = int(Lx/30.), int(Ly/30.)      # High-res ground truth
-Nx_high, Ny_high = int(Lx/60.), int(Ly/60.)      # High-res ground truth
+#Nx_high, Ny_high = int(Lx/60.), int(Ly/60.)      # High-res ground truth
 Nx_low, Ny_low = int(Lx/60.), int(Ly/60.)        # Optimization mesh resolution sync
 
 class EquivalentSheetModel:
@@ -121,9 +122,14 @@ class EquivalentSheetModel:
             rho_h = jnp.full_like(Xh, target_config.get('base_rho', 7.85e-9))
             E_h = jnp.full_like(Xh, target_config.get('base_E', 210000.0))
             
+            # Combine Pattern Z (pz) with Base Mesh Z (Tray Height)
+            # This ensures visualization shows the 3D tray shape, not just the flat pattern.
+            base_z_h = fem_high.nodes[:, 2].reshape(Xh.shape)
+            z_h_full = base_z_h + z_h
+            
             params_high = {
                 't': t_h.flatten(), 
-                'z': z_h.flatten(), 
+                'z': z_h.flatten(), # Solver uses 'add' logic now, so we keep the relative pattern here
                 'rho': rho_h.flatten(), 
                 'E': E_h.flatten()
             }
@@ -133,37 +139,45 @@ class EquivalentSheetModel:
             dx, dy = self.fem.Lx/Nx_h, self.fem.Ly/Ny_h
             self.target_mass = float(jnp.sum(t_h * rho_h) * dx * dy)
             
-            # [STAGE 1] Interactive Pattern Check
-            stage1_visualize_patterns(Nx_h, Ny_h, Xh, Yh, t_h, z_h)
+        # --- Visualization must happen AFTER cache/generation is settled ---
+        # 2.5 Combine Pattern Z (pz) with Base Mesh Z (Tray Height) for 3D View
+        # This ensures visualization shows the 3D tray shape, even if loading from an old flat cache.
+        t_h = self.target_params_high['t'].reshape(Xh.shape)
+        z_h = self.target_params_high['z'].reshape(Xh.shape)
+        base_z_h = self.fem_high.nodes[:, 2].reshape(Xh.shape)
+        z_h_full = base_z_h + z_h
+        
+        # [STAGE 1] Interactive Pattern Check - Always use latest mesh coords
+        stage1_visualize_patterns(Nx_h, Ny_h, Xh, Yh, t_h, z_h_full)
             
-            # 3. Solve FEM for each load case (High Fidelity - Sparse Solve)
-            print("\nSolving High-Resolution Ground Truth (Sparse)...")
-            K_h, M_h = fem_high.assemble(params_high, sparse=True)
-            self.targets = []
+        # 3. Solve FEM for each load case (High Fidelity - Sparse Solve)
+        print("\nSolving High-Resolution Ground Truth (Sparse)...")
+        K_h, M_h = fem_high.assemble(self.target_params_high, sparse=True)
+        self.targets = []
+        
+        for case in self.cases:
+            print(f" -> Solving Case: {case.name}")
+            fixed_dofs, fixed_vals, F = case.get_bcs(fem_high)
+            free_dofs = np.setdiff1d(np.arange(fem_high.total_dof), fixed_dofs)
+            u = fem_high.solve_static_sparse(K_h, F, free_dofs, fixed_dofs, fixed_vals)
             
-            for case in self.cases:
-                print(f" -> Solving Case: {case.name}")
-                fixed_dofs, fixed_vals, F = case.get_bcs(fem_high)
-                free_dofs = np.setdiff1d(np.arange(fem_high.total_dof), fixed_dofs)
-                u = fem_high.solve_static_sparse(K_h, F, free_dofs, fixed_dofs, fixed_vals)
-                
-                # Compute Full Reaction Forces (Sparse Dot)
-                F_int = K_h.dot(np.array(u))
-                R_residual = F_int - np.array(F)
-                
-                self.targets.append({
-                    'case_name': case.name,
-                    'weight': case.weight,
-                    'u_static': np.array(u[2::6]), # W-displacement only
-                    'u_full': np.array(u),         # Full 6-DOF displacement
-                    'reaction_full': np.array(R_residual), # Full reaction force vector
-                    'max_surface_stress': np.array(fem_high.compute_max_surface_stress(u, params_high, K=K_h)),
-                    'max_surface_strain': np.array(fem_high.compute_max_surface_strain(u, params_high, K=K_h)),
-                    'strain_energy_density': np.array(fem_high.compute_strain_energy_density(u, params_high, K=K_h)),
-                    'params': params_high,
-                    'fixed_dofs': np.array(fixed_dofs), # Store BCs for visualization
-                    'force_vector': np.array(F)         # Store Loads for visualization
-                })
+            # Compute Full Reaction Forces (Sparse Dot)
+            F_int = K_h.dot(np.array(u))
+            R_residual = F_int - np.array(F)
+            
+            self.targets.append({
+                'case_name': case.name,
+                'weight': case.weight,
+                'u_static': np.array(u[2::6]), # W-displacement only
+                'u_full': np.array(u),         # Full 6-DOF displacement
+                'reaction_full': np.array(R_residual), # Full reaction force vector
+                'max_surface_stress': np.array(fem_high.compute_max_surface_stress(u, params_high, K=K_h)),
+                'max_surface_strain': np.array(fem_high.compute_max_surface_strain(u, params_high, K=K_h)),
+                'strain_energy_density': np.array(fem_high.compute_strain_energy_density(u, params_high, K=K_h)),
+                'params': params_high,
+                'fixed_dofs': np.array(fixed_dofs), # Store BCs for visualization
+                'force_vector': np.array(F)         # Store Loads for visualization
+            })
                 
             # --- NEW: Generate Summary Ground Truth Plot ---
             print("Generating Ground Truth Summary Plot (3xN)...")
@@ -1211,11 +1225,23 @@ class EquivalentSheetModel:
         print("\n[OK] Comprehensive verification report saved: verification_report.md")
         print("[OK] Verification plots saved: verify_3d_*.png")
 
-        # 7. Final Interactive Stage (PyVista) - Optional but good for inspection
-        opt_eigen = {'vals': vals_opt[s_idx_opt:s_idx_opt+n_modes], 'modes': vecs_opt[2::6, s_idx_opt:s_idx_opt+n_modes]}
+        # 7. Final Interactive Stage (PyVista) - Resolution Independent Comparison
+        print("\nSolving Optimized Low-Res Model for 3D Comparison...")
+        K_l, M_l = self.fem.assemble(self.optimized_params, sparse=True)
+        vals_l, vecs_l = self.fem.solve_eigen_sparse(K_l, M_l, num_modes=n_modes + 10)
+        # Match elastic modes for low-res
+        freq_l_all = np.sqrt(np.maximum(np.array(vals_l), 0.0)) / (2*np.pi)
+        log_fl = np.log(np.maximum(freq_l_all[:15], 1e-6))
+        gapsl = np.concatenate([[0], log_fl[1:] - log_fl[:-1]])
+        s_idx_l = np.argmax((freq_l_all > 1.0) & (gapsl > 1.0) | (freq_l_all > 20.0))
+        opt_eigen_l = {
+            'vals': vals_l[s_idx_l : s_idx_l + n_modes], 
+            'modes': vecs_l[2::6, s_idx_l : s_idx_l + n_modes]
+        }
+
         stage3_visualize_comparison(
-            self.fem_high, self.targets, opt_params_h, self.target_params_high,
-            opt_eigen=opt_eigen, tgt_eigen=self.target_eigen
+            self.fem_high, self.fem, self.targets, self.optimized_params, self.target_params_high,
+            opt_eigen=opt_eigen_l, tgt_eigen=self.target_eigen
         )
 
 # ==============================================================================
@@ -1239,7 +1265,7 @@ if __name__ == '__main__':
     # 3. Ground Truth Generation (target_config)
     target_config = {
         'pattern': 'ABC',           'base_t': 1.0, 
-        #'bead_t': {'A': 2.0, 'B': 2.5, 'C': 1.5},
+        'bead_t': {'A': 2.0, 'B': 2.5, 'C': 1.5},
         'pattern_pz': 'TNYBV',  'bead_pz': {'T': 12.0, 'N': 10.0, 'Y': 15.0, 'B': 12.0, 'V': 4.0},
         'base_rho': 7.85e-9,        'base_E': 210000.0,
     }

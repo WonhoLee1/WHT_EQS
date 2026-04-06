@@ -393,7 +393,7 @@ class ShellFEM:
         self.trias = jnp.array(trias) if trias is not None else jnp.zeros((0,3), dtype=jnp.int32)
         self.num_nodes = len(self.nodes)
         self.total_dof = self.num_nodes * 6
-        self.node_coords = self.nodes[:, :2]
+        self.node_coords = self.nodes # Store full 3D coordinates (X, Y, Z) for visualization
         
         if len(self.quads) > 0:
             self.quad_dof_idx = vmap(lambda e: jnp.concatenate([jnp.arange(6)+n*6 for n in e]))(self.quads)
@@ -407,12 +407,17 @@ class ShellFEM:
 
     def assemble(self, params, sparse=False):
         E, t, rho, nu = params.get('E'), params.get('t'), params.get('rho'), 0.3
+        
+        curr_nodes = self.nodes
+        if 'z' in params:
+            curr_nodes = self.nodes.at[:, 2].add(params['z'])
+            
         K_g = jnp.zeros((self.total_dof, self.total_dof))
         M_g = jnp.zeros((self.total_dof, self.total_dof))
         
         # Q4 Assembly
         if len(self.quads) > 0:
-            ec = self.nodes[self.quads]
+            ec = curr_nodes[self.quads]
             v12 = ec[:,1,:]-ec[:,0,:]
             Lx = jnp.linalg.norm(v12, axis=1, keepdims=True).clip(1e-12)
             e1 = v12 / Lx
@@ -440,7 +445,7 @@ class ShellFEM:
             
         # T3 Assembly
         if len(self.trias) > 0:
-            ec = self.nodes[self.trias]
+            ec = curr_nodes[self.trias]
             v12 = ec[:,1,:]-ec[:,0,:]
             e1 = v12 / jnp.linalg.norm(v12, axis=1, keepdims=True).clip(1e-12)
             v13 = ec[:,2,:]-ec[:,0,:]
