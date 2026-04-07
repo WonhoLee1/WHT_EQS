@@ -674,20 +674,28 @@ def stage3_visualize_comparison(fem_target, fem_optimized, targets, optimized_pa
             # Base Tray Z
             z_base = np.array(fem.node_coords[:, 2]).flatten()
             
+            num_nodes = len(fem.node_coords)
+            data_arr = np.array(data).flatten()
+            if data_arr.size == 1:
+                data_arr = np.full(num_nodes, data_arr[0])
+            elif data_arr.size != num_nodes:
+                # Fallback if somehow it's still inconsistent
+                pass
+                
             # Determine 3D Point Coordinates
             if field_name == "Z-Height":
-                z_full = z_base + data
+                z_full = z_base + data_arr
             elif eigen_mode is not None:
                 # 3D Deformation for Mode Shape
                 scale = 50.0 # Amplitude for visualization
-                z_full = z_base + data * scale
+                z_full = z_base + data_arr * scale
             else:
                 z_full = z_base
                 
             grid = pv.StructuredGrid()
             grid.points = np.column_stack([x, y, z_full])
             grid.dimensions = [nx + 1, ny + 1, 1]
-            grid.point_data[field_name] = data
+            grid.point_data[field_name] = data_arr
             
             # Use appropriate colormap
             cmap_local = "coolwarm" if eigen_mode is not None else "viridis"
