@@ -171,90 +171,83 @@ class EquivalentSheetModel:
                 'u_static': np.array(u[2::6]), # W-displacement only
                 'u_full': np.array(u),         # Full 6-DOF displacement
                 'reaction_full': np.array(R_residual), # Full reaction force vector
-                'max_surface_stress': np.array(fem_high.compute_max_surface_stress(u, params_high, K=K_h)),
-                'max_surface_strain': np.array(fem_high.compute_max_surface_strain(u, params_high, K=K_h)),
-                'strain_energy_density': np.array(fem_high.compute_strain_energy_density(u, params_high, K=K_h)),
-                'params': params_high,
+                'max_surface_stress': np.array(fem_high.compute_max_surface_stress(u, self.target_params_high)),
+                'max_surface_strain': np.array(fem_high.compute_max_surface_strain(u, self.target_params_high)),
+                'strain_energy_density': np.array(fem_high.compute_strain_energy_density(u, self.target_params_high)),
+                'params': self.target_params_high,
                 'fixed_dofs': np.array(fixed_dofs), # Store BCs for visualization
                 'force_vector': np.array(F)         # Store Loads for visualization
             })
                 
-            # --- NEW: Generate Summary Ground Truth Plot ---
-            print("Generating Ground Truth Summary Plot (3xN)...")
-            n_cases = len(self.cases)
-            plt.rcParams.update({'font.size': 8})
-            fig, axes = plt.subplots(3, n_cases, figsize=(4*n_cases, 10), squeeze=False)
-            fig.suptitle(f"Ground Truth Analysis Summary (Resolution: {Nx_h}x{Ny_h})\nRows: Disp, Stress, Strain | Colormap: jet", fontsize=10)
+        # --- NEW: Generate Summary Ground Truth Plot (Moved Outside Loop) ---
+        print("\nGenerating Ground Truth Summary Plot (3xN)...")
+        n_cases = len(self.cases)
+        plt.rcParams.update({'font.size': 8})
+        fig, axes = plt.subplots(3, n_cases, figsize=(4*n_cases, 10), squeeze=False)
+        fig.suptitle(f"Ground Truth Analysis Summary (Resolution: {Nx_h}x{Ny_h})\nRows: Disp, Stress, Strain | Colormap: jet", fontsize=10)
+        
+        xh, yh = np.linspace(0, self.fem.Lx, Nx_h+1), np.linspace(0, self.fem.Ly, Ny_h+1)
+        
+        for i, target in enumerate(self.targets):
+            # Row 0: Displacement
+            data_w = target['u_static'].reshape(Ny_h+1, Nx_h+1)
+            im0 = axes[0, i].contourf(xh, yh, data_w, 30, cmap='jet')
+            axes[0, i].set_title(f"Case: {target['case_name']}\nMax Disp: {np.max(np.abs(data_w)):.3f}mm", fontsize=8)
+            axes[0, i].set_aspect('equal')
+            plt.colorbar(im0, ax=axes[0, i], shrink=0.7)
             
-            xh, yh = np.linspace(0, self.fem.Lx, Nx_h+1), np.linspace(0, self.fem.Ly, Ny_h+1)
+            # Row 1: Max Surface Stress
+            data_s = target['max_surface_stress'].reshape(Ny_h+1, Nx_h+1)
+            im1 = axes[1, i].contourf(xh, yh, data_s, 30, cmap='jet')
+            axes[1, i].set_title(f"Max Stress: {np.max(data_s):.2f} MPa", fontsize=8)
+            axes[1, i].set_aspect('equal')
+            plt.colorbar(im1, ax=axes[1, i], shrink=0.7)
             
-            for i, target in enumerate(self.targets):
-                # Node locations for reshaping
-                # Node (i,j) has index j*(Nx_h+1) + i
-                # So to reshape back, we can use (Nx_h+1, Ny_h+1, ...) with order='F'
-                
-                # Row 0: Displacement
-                data_w = target['u_static'].reshape(Ny_h+1, Nx_h+1)
-                im0 = axes[0, i].contourf(xh, yh, data_w, 30, cmap='jet')
-                axes[0, i].set_title(f"Case: {target['case_name']}\nMax Disp: {np.max(np.abs(data_w)):.3f}mm", fontsize=8)
-                axes[0, i].set_aspect('equal')
-                plt.colorbar(im0, ax=axes[0, i], shrink=0.7)
-                
-                # Row 1: Max Surface Stress
-                data_s = target['max_surface_stress'].reshape(Ny_h+1, Nx_h+1)
-                im1 = axes[1, i].contourf(xh, yh, data_s, 30, cmap='jet')
-                axes[1, i].set_title(f"Max Stress: {np.max(data_s):.2f} MPa", fontsize=8)
-                axes[1, i].set_aspect('equal')
-                plt.colorbar(im1, ax=axes[1, i], shrink=0.7)
-                
-                # Row 2: Max Surface Strain
-                data_e = target['max_surface_strain'].reshape(Ny_h+1, Nx_h+1) * 1000 # to microstrain/e-3
-                im2 = axes[2, i].contourf(xh, yh, data_e, 30, cmap='jet')
-                axes[2, i].set_title(f"Max Strain: {np.max(data_e):.3f} e-3", fontsize=8)
-                axes[2, i].set_aspect('equal')
-                plt.colorbar(im2, ax=axes[2, i], shrink=0.7)
-                
-            plt.tight_layout(rect=[0, 0, 1, 0.96])
-            plt.savefig("ground_truth_3d_loadcases.png", dpi=150)
-            plt.close()
-            print(" -> Saved: ground_truth_3d_loadcases.png")
+            # Row 2: Max Surface Strain
+            data_e = target['max_surface_strain'].reshape(Ny_h+1, Nx_h+1) * 1000 # to microstrain/e-3
+            im2 = axes[2, i].contourf(xh, yh, data_e, 30, cmap='jet')
+            axes[2, i].set_title(f"Max Strain: {np.max(data_e):.3f} e-3", fontsize=8)
+            axes[2, i].set_aspect('equal')
+            plt.colorbar(im2, ax=axes[2, i], shrink=0.7)
             
-            # 4. Solve Eigenmodes (Sparse for speed - Already assembled)
-            print("Solving Target Eigenmodes (Sparse computation)...")
-            # K_h, M_h already assembled as sparse above
-            vals, vecs = fem_high.solve_eigen_sparse(K_h, M_h, num_modes=num_modes_save + 10)
-            
-            # Smart Elastic Mode Detection (Log-Gap Method)
-            # Using logarithmic jump detection to robustly find the first true elastic mode.
-            all_freqs_h = np.sqrt(np.maximum(np.array(vals), 0.0)) / (2 * np.pi)
-            log_f = np.log(np.maximum(all_freqs_h[:15], 1e-6))
-            gaps = np.concatenate([[0], log_f[1:] - log_f[:-1]])
-            
-            # A mode is elastic if it's > 1Hz and follows a major jump, or if it's clearly high freq (>20Hz)
-            is_elastic = (all_freqs_h > 1.0) & (gaps > 1.0) | (all_freqs_h > 20.0)
-            start_idx = np.argmax(is_elastic) if np.any(is_elastic) else (6 if len(all_freqs_h) > 6 else 0)
-            
-            print(f" -> Found first elastic mode at index {start_idx} ({all_freqs_h[start_idx]:.2f} Hz)")
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.savefig("ground_truth_3d_loadcases.png", dpi=150)
+        plt.close()
+        print(" -> Saved: ground_truth_3d_loadcases.png")
+        
+        # 4. Solve Eigenmodes (Sparse for speed - Moved Outside Loop)
+        print("Solving Target Eigenmodes (Sparse computation)...")
+        # K_h, M_h already assembled as sparse above
+        vals, vecs = fem_high.solve_eigen_sparse(K_h, M_h, num_modes=num_modes_save + 10)
+        
+        # Smart Elastic Mode Detection (Log-Gap Method)
+        all_freqs_h = np.sqrt(np.maximum(np.array(vals), 0.0)) / (2 * np.pi)
+        log_f = np.log(np.maximum(all_freqs_h[:15], 1e-6))
+        gaps = np.concatenate([[0], log_f[1:] - log_f[:-1]])
+        is_elastic = (all_freqs_h > 1.0) & (gaps > 1.0) | (all_freqs_h > 20.0)
+        start_idx = np.argmax(is_elastic) if np.any(is_elastic) else (6 if len(all_freqs_h) > 6 else 0)
+        
+        print(f" -> Found first elastic mode at index {start_idx} ({all_freqs_h[start_idx]:.2f} Hz)")
 
-            self.target_start_idx = start_idx
-            self.target_eigen = {
-                'vals': vals[start_idx : start_idx + num_modes_save],
-                'modes': vecs[2::6, start_idx : start_idx + num_modes_save] # W-component
-            }
-            
-            # Save the recalculation to cache
-            print(f"Saving Ground Truth to cache ({cache_file})...")
-            cache_data = {
-                'target_params_high': self.target_params_high,
-                'target_mass': self.target_mass,
-                'targets': self.targets,
-                'target_eigen': self.target_eigen
-            }
-            try:
-                with open(cache_file, 'wb') as f:
-                    pickle.dump(cache_data, f)
-            except Exception as e:
-                print(f"[WARNING] Failed to save cache: {e}")
+        self.target_start_idx = start_idx
+        self.target_eigen = {
+            'vals': vals[start_idx : start_idx + num_modes_save],
+            'modes': vecs[2::6, start_idx : start_idx + num_modes_save] # W-component
+        }
+        
+        # Save to cache
+        print(f"Saving Ground Truth to cache ({cache_file})...")
+        cache_data = {
+            'target_params_high': self.target_params_high,
+            'target_mass': self.target_mass,
+            'targets': self.targets,
+            'target_eigen': self.target_eigen
+        }
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(cache_data, f)
+        except Exception as e:
+            print(f"[WARNING] Failed to save cache: {e}")
 
         # Pre-output target frequencies for user overview
         target_freqs = np.sqrt(np.maximum(np.array(self.target_eigen['vals']), 0.0)) / (2 * np.pi)
@@ -270,11 +263,11 @@ class EquivalentSheetModel:
                  use_surface_strain=True,
                  use_mass_constraint=True, 
                  mass_tolerance=0.05,
-                 max_iterations=300, 
+                 max_iterations=200, 
                  use_early_stopping=True, 
                  early_stop_patience=100, 
                  early_stop_tol=1e-8,
-                 learning_rate=0.01,
+                 learning_rate=0.3,
                  num_modes_loss=None,
                  min_bead_width=150.0,
                  mac_search_window=2,
@@ -437,7 +430,9 @@ class EquivalentSheetModel:
         params = {k: v for k, v in full_params_scaled.items() if opt_config.get(k, {}).get('opt', True)}
         fixed_params_scaled = {k: v for k, v in full_params_scaled.items() if not opt_config.get(k, {}).get('opt', True)}
         
-        # Re-applying robust auto-rate scheduling (Warmup + Cosine Decay)
+        # [FIX] Ensure scaling is a dict of pure Python floats to avoid JAX Tracer issues inside JIT
+        scaling_consts = {k: float(v) for k, v in self.scaling.items()}
+        
         warmup_steps = min(max_iterations // 2, max(1, max_iterations // 20))
         if max_iterations < 2: warmup_steps = 0 # No warmup for single step
         lr_schedule = optax.warmup_cosine_decay_schedule(
@@ -468,9 +463,10 @@ class EquivalentSheetModel:
             case_bcs.append({'fd': fd, 'fv': fv, 'F': F, 'free': jnp.setdiff1d(jnp.arange(self.fem.total_dof), fd)})
 
         @jax.jit
-        def loss_fn(p_scaled, fixed_p_scaled, scales):
-            combined_phys = {k: v * scales[k] for k, v in p_scaled.items()}
-            for k, v in fixed_p_scaled.items(): combined_phys[k] = v * scales[k]
+        def loss_fn(p_scaled, fixed_p_scaled):
+            # Use captured scaling_consts (constants in JIT)
+            combined_phys = {k: v * scaling_consts[k] for k, v in p_scaled.items()}
+            for k, v in fixed_p_scaled.items(): combined_phys[k] = v * scaling_consts[k]
             
             # Special case for 'z' calculation from 'pz' (Topography)
             if 'pz' in combined_phys:
@@ -478,7 +474,10 @@ class EquivalentSheetModel:
                 if pz_val.ndim == 1 and pz_val.shape[0] == 1: # Global PZ
                     combined_phys['z'] = jnp.full((Ny_l+1, Nx_l+1), pz_val[0])
                 elif filter_kernel is not None:
-                    combined_phys['z'] = jax.scipy.signal.convolve2d(pz_val, filter_kernel, mode='same')
+                    # [IMPROVED] Use reflect padding to prevent boundary dampening artifacts
+                    pad_h, pad_w = filter_kernel.shape[0]//2, filter_kernel.shape[1]//2
+                    pz_padded = jnp.pad(pz_val, ((pad_h, pad_h), (pad_w, pad_w)), mode='reflect')
+                    combined_phys['z'] = jax.scipy.signal.convolve2d(pz_padded, filter_kernel, mode='valid')
                 else:
                     combined_phys['z'] = pz_val
             
@@ -499,25 +498,29 @@ class EquivalentSheetModel:
                 b = case_bcs[i]
                 u = self.fem.solve_static_partitioned(K, b['F'], b['free'], b['fd'], b['fv'])
                 w = u[2::6]
-                # [FIXED] Static Errors: Normalization bug fixes and robust scaling (eps=1e-3)
+                
+                # [SPEED OPTIMIZATION] Compute field results once per load case
+                # This avoids 3x redundant FEM logic calls for stress, strain, and energy
+                f_res = self.fem.compute_field_results(u, p_actual)
+                
                 eps = 1e-3
                 
-                # Displacement: Normalized by target mean
+                # Displacement loss
                 scale_disp = jnp.mean(jnp.abs(self.targets_low[i]['u_static'])) + eps
                 delta_disp = w - self.targets_low[i]['u_static']
                 l_static += jnp.mean((delta_disp / scale_disp)**2) * self.targets_low[i]['weight']
                 
                 if use_surface_stress:
                     scale_stress = jnp.mean(jnp.abs(self.targets_low[i]['max_stress'])) + eps
-                    delta_stress = self.fem.compute_max_surface_stress(u, p_actual, K=K) - self.targets_low[i]['max_stress']
+                    delta_stress = self.fem.compute_max_surface_stress(u, p_actual, field_results=f_res) - self.targets_low[i]['max_stress']
                     l_stress += jnp.mean((delta_stress / scale_stress)**2)
                 if use_surface_strain:
                     scale_strain = jnp.mean(jnp.abs(self.targets_low[i]['max_strain'])) + eps
-                    delta_strain = self.fem.compute_max_surface_strain(u, p_actual, K=K) - self.targets_low[i]['max_strain']
+                    delta_strain = self.fem.compute_max_surface_strain(u, p_actual, field_results=f_res) - self.targets_low[i]['max_strain']
                     l_strain += jnp.mean((delta_strain / scale_strain)**2)
                 if use_strain_energy:
                     scale_energy = jnp.mean(jnp.abs(self.targets_low[i]['strain_energy_density'])) + eps
-                    delta_energy = self.fem.compute_strain_energy_density(u, p_actual, K=K) - self.targets_low[i]['strain_energy_density']
+                    delta_energy = self.fem.compute_strain_energy_density(u, p_actual, field_results=f_res) - self.targets_low[i]['strain_energy_density']
                     l_energy += jnp.mean((delta_energy / scale_energy)**2)
                 
                 # Reaction loss
@@ -542,46 +545,41 @@ class EquivalentSheetModel:
             # --- [SPEED OPTIMIZATION] ---
             # If we don't care about frequency matching or mode shape matching, 
             # bypass the expensive O(N^3) dense eigen solver entirely!
+            # --- [SPEED OPTIMIZATION] ---
             if loss_weights.get('freq', 0.0) > 1e-6 or loss_weights.get('mode', 0.0) > 1e-6:
-                vals, vecs = self.fem.solve_eigen(K, M, num_modes=len(t_vals)+10)
-                freqs = jnp.sqrt(jnp.maximum(vals, 0.0)) / (2 * jnp.pi)
-                
-                # 1. Dynamic Elastic Mode Selection (Physically Consistent)
-                log_f = jnp.log(jnp.maximum(freqs[:15], 1e-6))
-                gaps = jnp.concatenate([jnp.zeros(1), log_f[1:] - log_f[:-1]])
-                current_idx = jnp.argmax((freqs > 1.0) & (gaps > 1.0) | (freqs > 20.0))
-                
+                # fem.solve_eigen now already filters and identifies elastic modes!
                 n_tgt = len(t_vals)
-                search_window = mac_search_window  # Allow searching in n_tgt + candidates to handle swaps
+                freqs, vecs = self.fem.solve_eigen(K, M, num_modes=n_tgt)
                 
-                # 2. Frequency Matching (Relative Error on Eigenvalues)
-                curr_vals = jax.lax.dynamic_slice_in_dim(vals, current_idx, n_tgt)
-                l_freq = jnp.mean((curr_vals / (t_vals + 1e-6) - 1.0)**2)
+                # 1. Frequency Matching (Relative Error on Eigenvalues λ = ω^2)
+                # Since frequencies are already in Hz: (f_opt / f_tgt - 1)^2
+                l_freq = jnp.mean((freqs / (t_vals + 1e-6) - 1.0)**2)
                 
-                # 3. Best-Fit MAC Matrix Matching (Mode Tracking)
-                cand_modes = jax.lax.dynamic_slice_in_dim(vecs[2::6, :], current_idx, n_tgt + search_window, axis=1)
+                # 2. Best-Fit MAC Matrix Matching
+                # Indexing is now simplified as f_opt[0] corresponds to f_tgt[0]
+                cand_modes = vecs[2::6, :] # Extract w-displacement (out-of-plane)
                 
-                # Compute MAC Matrix [n_target, n_candidates]
-                dots = jnp.dot(t_modes_l.T, cand_modes) # (n_tgt, n_tgt + search_window)
-                norm_t = jnp.sum(t_modes_l**2, axis=0, keepdims=True) # (1, n_tgt)
-                norm_c = jnp.sum(cand_modes**2, axis=0, keepdims=True) # (1, n_tgt + search_window)
+                # Compute MAC [n_target, n_opt]
+                dots = jnp.dot(t_modes_l.T, cand_modes) 
+                norm_t = jnp.sum(t_modes_l**2, axis=0, keepdims=True)
+                norm_c = jnp.sum(cand_modes**2, axis=0, keepdims=True)
                 mac_matrix = (dots**2) / (norm_t.T @ norm_c + 1e-10)
                 
-                best_mac_per_target = jnp.max(mac_matrix, axis=1)
+                best_mac_per_target = jnp.max(mac_matrix, axis=1) # Perfect match = 1.0
                 
                 if mode_match_type == 'mac':
                     l_mode = jnp.mean((1.0 - best_mac_per_target)**2)
-                else:
-                    best_match_idx = jnp.argmax(mac_matrix, axis=1) # (n_tgt,)
-                    best_cand_modes = cand_modes[:, best_match_idx] # (n_dofs, n_tgt)
+                else: 
+                    # Hybrid/Direct matching for shape consistency
+                    best_match_idx = jnp.argmax(mac_matrix, axis=1)
+                    best_cand_modes = cand_modes[:, best_match_idx]
                     
-                    best_dots = jnp.diagonal(jnp.dot(t_modes_l.T, best_cand_modes)) # (n_tgt,)
+                    best_dots = jnp.diagonal(jnp.dot(t_modes_l.T, best_cand_modes))
                     signs = jnp.where(best_dots < 0, -1.0, 1.0)
                     aligned_modes = best_cand_modes * signs
                     
                     target_normed = t_modes_l / jnp.sqrt(norm_t.reshape(1, -1) + 1e-10)
                     cand_normed = aligned_modes / jnp.sqrt(jnp.sum(aligned_modes**2, axis=0, keepdims=True) + 1e-10)
-                    
                     l_shape_mse = jnp.mean((target_normed - cand_normed)**2)
                     
                     if mode_match_type == 'direct':
@@ -589,7 +587,7 @@ class EquivalentSheetModel:
                     else: # 'hybrid'
                         l_mode = jnp.mean((1.0 - best_mac_per_target)**2) + (l_shape_mse * 50.0)
                 
-                f1_hz = jnp.sqrt(jnp.maximum(vals[current_idx], 0.0)) / (2 * jnp.pi)
+                f1_hz = freqs[0]
             
             # --- [FIXED] 질량 제약(Mass Constraint)에 mass_tolerance 적용 ---
             # 질량이 허용 한도(tolerance)를 넘어서면 폭발적인 페널티(Quadratic Penalty)를 부여합니다.
@@ -637,12 +635,12 @@ class EquivalentSheetModel:
         print("-" * 128)
 
         for i in range(max_iterations):
-            (val, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, fixed_params_scaled, self.scaling)
+            (val, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, fixed_params_scaled)
             
             # [FIXED LOGIC] Store BEST params BEFORE they are updated by the optimizer
             if val < best_loss - early_stop_tol:
                 best_loss, wait = val, 0
-                best_params = {k: v.copy() for k, v in params.items()} # Deep copy of JAX arrays
+                best_params = jax.tree_util.tree_map(jnp.array, params) # Safe JAX capture
                 best_iter = i
             else:
                 wait += 1
@@ -875,10 +873,10 @@ class EquivalentSheetModel:
             w_opt = u_opt[2::6].reshape(Ny_h+1, Nx_h+1)
             
             stress_ref = tgt['max_surface_stress'].reshape(Ny_h+1, Nx_h+1)
-            stress_opt = self.fem_high.compute_max_surface_stress(u_opt, opt_params_h, K=K_opt).reshape(Ny_h+1, Nx_h+1)
+            stress_opt = self.fem_high.compute_max_surface_stress(u_opt, opt_params_h).reshape(Ny_h+1, Nx_h+1)
             
             strain_ref = tgt['max_surface_strain'].reshape(Ny_h+1, Nx_h+1)
-            strain_opt = self.fem_high.compute_max_surface_strain(u_opt, opt_params_h, K=K_opt).reshape(Ny_h+1, Nx_h+1)
+            strain_opt = self.fem_high.compute_max_surface_strain(u_opt, opt_params_h).reshape(Ny_h+1, Nx_h+1)
 
             # Calculation of Metric: Similarity % = 100 * (1 - RMSE / range)
             def get_metrics(ref, opt):
@@ -1228,15 +1226,12 @@ class EquivalentSheetModel:
         # 7. Final Interactive Stage (PyVista) - Resolution Independent Comparison
         print("\nSolving Optimized Low-Res Model for 3D Comparison...")
         K_l, M_l = self.fem.assemble(self.optimized_params, sparse=True)
-        vals_l, vecs_l = self.fem.solve_eigen_sparse(K_l, M_l, num_modes=n_modes + 10)
-        # Match elastic modes for low-res
-        freq_l_all = np.sqrt(np.maximum(np.array(vals_l), 0.0)) / (2*np.pi)
-        log_fl = np.log(np.maximum(freq_l_all[:15], 1e-6))
-        gapsl = np.concatenate([[0], log_fl[1:] - log_fl[:-1]])
-        s_idx_l = np.argmax((freq_l_all > 1.0) & (gapsl > 1.0) | (freq_l_all > 20.0))
+        # solve_eigen_sparse now already identifies and returns ONLY elastic modes!
+        freq_l, vecs_l = self.fem.solve_eigen_sparse(K_l, M_l, num_modes=n_modes)
+        
         opt_eigen_l = {
-            'vals': vals_l[s_idx_l : s_idx_l + n_modes], 
-            'modes': vecs_l[2::6, s_idx_l : s_idx_l + n_modes]
+            'vals': (2 * np.pi * freq_l)**2,  # Convert Hz back to eigenvalues if needed by viewer
+            'modes': vecs_l[2::6, :n_modes]   # Extract w-displacement
         }
 
         stage3_visualize_comparison(
@@ -1249,7 +1244,7 @@ class EquivalentSheetModel:
 # ==============================================================================
 if __name__ == '__main__':
     # XLA Flags (Optimized for CPU)
-    os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=1 --xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=4"
+    os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=1 --xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=6"
 
     model = EquivalentSheetModel(Lx, Ly, Nx_low, Ny_low)
     
@@ -1287,7 +1282,7 @@ if __name__ == '__main__':
     weights = {
         'static': 1.0,           # Displacement matching
         'reaction': 1.0,         # Reaction force matching (NEW)
-        'freq': 1.0,            # [CRITICAL] Increase frequency priority
+        'freq': 5.0,            # [CRITICAL] Increase frequency priority
         'mode': 1.000,           # [Gentle] Mode matching (MAC) - Start small to avoid shock
         'curvature': 0.0,        # [Legacy]
         'moment': 0.0,           # [Legacy]
@@ -1296,7 +1291,7 @@ if __name__ == '__main__':
         'surface_strain': .0,   # Surface strain matching
         'gt_z': 0.0,             # [NEW 옵션] Ground Truth 좌표 1:1 직접 매칭 여부 (강제 복원용). 현재는 0.0 (끔)
         'mass': 1.0,            # Mass constraint
-        'reg': 0.001              # Regularization
+        'reg': 0.01              # Regularization
     }
         
     # 6. Run Optimization - Two-Stage approach
@@ -1331,7 +1326,7 @@ if __name__ == '__main__':
                                         mac_search_window=5,         # 모드 순서가 뒤집혀도 찾을 수 있도록 여유로운 비교 범위 부여
                                         mode_match_type='mac',    # 'mac', 'direct', 'hybrid' (제안된 형상 직접 매칭 방식)
                                         init_pz_from_gt=True,        # [NEW 옵션] 타겟 Ground Truth 좌표를 기반으로 초기 형태 전사 (사용)
-                                        gt_init_scale=0.3)           # 타겟 Z 변위량의 10% 스케일을 최초 초기값으로 부과
+                                        gt_init_scale=0.5)           # 상향 조정 (0.3 -> 0.5)
                                         
         # --- STAGE 2: MAC FINE-TUNING ---
         #print("\n\n" + "#"*70)

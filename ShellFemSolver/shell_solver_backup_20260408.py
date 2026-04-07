@@ -39,7 +39,7 @@ def recover_stress_tria_membrane(u, nodes, trias, E, nu):
             [c1, b1, c2, b2, c3, b3]
         ])
         return B @ u_el
-    return vmap(get_element_strain_inner)(jnp.arange(trias.shape[0]))
+    return vmap(get_element_strain_inner)(jnp.arange(len(trias)))
 
 def _get_B_tria_membrane(nodes):
     """Constant Strain Triangle (CST) B-matrix for membrane."""
@@ -162,7 +162,7 @@ def recover_curvature_tria_bending(u, nodes, trias, E, nu, t):
         B = _get_B_dkt(1.0/3.0, 1.0/3.0, t_nodes)
         return B @ udkt
     
-    return vmap(get_curv)(jnp.arange(trias.shape[0]))
+    return vmap(get_curv)(jnp.arange(len(trias)))
 
 def recover_curvature_quad_bending(u, nodes, quads, E, nu, t):
     """Q4 Mindlin curvature recovery."""
@@ -193,11 +193,11 @@ def recover_curvature_quad_bending(u, nodes, quads, E, nu, t):
         tx_l = tx_g * e1[0] + ty_g * e1[1]
         ty_l = tx_g * e2[0] + ty_g * e2[1]
         
-        kx = jnp.dot(dn_dx, ty_l)
-        ky = -jnp.dot(dn_dy, tx_l)
-        kxy = jnp.dot(dn_dy, ty_l) - jnp.dot(dn_dx, tx_l)
+        kx = -jnp.dot(dn_dx, ty_l)
+        ky = jnp.dot(dn_dy, tx_l)
+        kxy = -jnp.dot(dn_dy, ty_l) + jnp.dot(dn_dx, tx_l)
         return jnp.array([kx, ky, kxy])
-    return vmap(get_curvature)(jnp.arange(quads.shape[0]))
+    return vmap(get_curvature)(jnp.arange(len(quads)))
 
 def recover_stress_quad_membrane(u, nodes, quads, E, nu):
     """Q4 membrane strain recovery."""
@@ -231,7 +231,7 @@ def recover_stress_quad_membrane(u, nodes, quads, E, nu):
         ey = jnp.dot(dn_dy, vl)
         exy = jnp.dot(dn_dy, ul) + jnp.dot(dn_dx, vl)
         return jnp.array([ex, ey, exy])
-    return vmap(get_eps)(jnp.arange(quads.shape[0]))
+    return vmap(get_eps)(jnp.arange(len(quads)))
 
 # ────────────────────────────────────────────────────────────────────
 # Safe Eigh
@@ -395,42 +395,28 @@ class ShellFEM:
         self.total_dof = self.num_nodes * 6
         self.node_coords = self.nodes # Store full 3D coordinates (X, Y, Z) for visualization
         
-        if self.quads.shape[0] > 0:
+        if len(self.quads) > 0:
             self.quad_dof_idx = vmap(lambda e: jnp.concatenate([jnp.arange(6)+n*6 for n in e]))(self.quads)
         else:
             self.quad_dof_idx = None
             
-        if self.trias.shape[0] > 0:
+        if len(self.trias) > 0:
             self.tria_dof_idx = vmap(lambda e: jnp.concatenate([jnp.arange(6)+n*6 for n in e]))(self.trias)
         else:
             self.tria_dof_idx = None
 
     def assemble(self, params, sparse=False):
-        # Universal property extraction with scalar support
-        n_nodes = self.nodes.shape[0]
-        
-        def get_p(key, default):
-            val = params.get(key)
-            # Use jnp.where to handle both scalars and arrays without Python branch
-            v = jnp.atleast_1d(jnp.array(val) if val is not None else default)
-            return jnp.where(v.shape[0] == 1, jnp.full(n_nodes, v[0]), v)
-            
-        E   = get_p('E', 210000.0)
-        t   = get_p('t', 1.0)
-        rho = get_p('rho', 7.85e-9)
-        nu  = 0.3
+        E, t, rho, nu = params.get('E'), params.get('t'), params.get('rho'), 0.3
         
         curr_nodes = self.nodes
         if 'z' in params:
-            z_off = get_p('z', 0.0)
-            curr_nodes = self.nodes.at[:, 2].add(z_off)
+            curr_nodes = self.nodes.at[:, 2].add(params['z'])
             
         K_g = jnp.zeros((self.total_dof, self.total_dof))
         M_g = jnp.zeros((self.total_dof, self.total_dof))
         
         # Q4 Assembly
-        n_quad = self.quads.shape[0]
-        if n_quad > 0:
+        if len(self.quads) > 0:
             ec = curr_nodes[self.quads]
             v12 = ec[:,1,:]-ec[:,0,:]
             Lx = jnp.linalg.norm(v12, axis=1, keepdims=True).clip(1e-12)
@@ -458,8 +444,7 @@ class ShellFEM:
             M_g = M_g.at[Gi, Gj].add(Mq.flatten())
             
         # T3 Assembly
-        n_tri = self.trias.shape[0]
-        if n_tri > 0:
+        if len(self.trias) > 0:
             ec = curr_nodes[self.trias]
             v12 = ec[:,1,:]-ec[:,0,:]
             e1 = v12 / jnp.linalg.norm(v12, axis=1, keepdims=True).clip(1e-12)
@@ -473,8 +458,8 @@ class ShellFEM:
             ly1 = jnp.sum((ec[:,1,:]-o)*e2, axis=1)
             lx2 = jnp.sum((ec[:,2,:]-o)*e1, axis=1)
             ly2 = jnp.sum((ec[:,2,:]-o)*e2, axis=1)
-            x2d = jnp.stack([jnp.zeros(n_tri), lx1, lx2], 1)
-            y2d = jnp.stack([jnp.zeros(n_tri), ly1, ly2], 1)
+            x2d = jnp.stack([jnp.zeros(len(self.trias)), lx1, lx2], 1)
+            y2d = jnp.stack([jnp.zeros(len(self.trias)), ly1, ly2], 1)
             
             def one_tria(Et, tt, rt, x, y, T3):
                 Kl, Ml = compute_tria3_local(Et, tt, nu, rt, x, y)
@@ -498,12 +483,12 @@ class ShellFEM:
             from scipy.sparse import coo_matrix
             
             rows, cols, k_vals, m_vals = [], [], [], []
-            if self.quads.shape[0] > 0:
+            if len(self.quads) > 0:
                 rows.append(np.array(self.quad_dof_idx[:, jnp.repeat(jnp.arange(24), 24)].flatten()))
                 cols.append(np.array(self.quad_dof_idx[:, jnp.tile(jnp.arange(24), 24)].flatten()))
                 k_vals.append(np.array(Kq).flatten())
                 m_vals.append(np.array(Mq).flatten())
-            if self.trias.shape[0] > 0:
+            if len(self.trias) > 0:
                 rows.append(np.array(self.tria_dof_idx[:, jnp.repeat(jnp.arange(18), 18)].flatten()))
                 cols.append(np.array(self.tria_dof_idx[:, jnp.tile(jnp.arange(18), 18)].flatten()))
                 k_vals.append(np.array(Kt).flatten())
@@ -523,22 +508,8 @@ class ShellFEM:
         m_inv_sqrt = 1.0 / jnp.sqrt(m_diag)
         K_sym = (K + K.T) / 2.0
         A = K_sym * m_inv_sqrt[:,None] * m_inv_sqrt[None,:] + jnp.eye(K.shape[0])*1e-10
-        
-        # Request more modes to identify and skip 6 RB modes
-        n_search = num_modes + 8
         vals, vecs = safe_eigh(A)
-        # vals and vecs are already sorted in safe_eigh
-        
-        # Convert to Hz for filtering
-        freqs = jnp.sqrt(jnp.maximum(vals, 0.0)) / (2 * jnp.pi)
-        vecs_phys = vecs * m_inv_sqrt[:,None]
-        
-        # Skip 6 rigid body modes for free-free mechanical analysis
-        # Total number of DOFs: 6*n_nodes. RBMs are modes 0-5.
-        rbm_skip = 6
-        res_freqs = freqs[rbm_skip : rbm_skip + num_modes]
-        res_vecs = vecs_phys[:, rbm_skip : rbm_skip + num_modes]
-        return res_freqs, res_vecs
+        return jnp.maximum(vals, 0.0)[:num_modes], (vecs * m_inv_sqrt[:,None])[:, :num_modes]
 
     def solve_static(self, params, F, prescribed_dofs, prescribed_vals, sparse=False):
         K, _ = self.assemble(params, sparse=sparse)
@@ -566,37 +537,13 @@ class ShellFEM:
         u[pd] = pv
         return jnp.array(u)
 
-    def solve_eigen_sparse(self, K_s, M_s, num_modes=12):
+    def solve_eigen_sparse(self, K_s, M_s, num_modes=10):
         """Solve generalized eigen problem using scipy.sparse.linalg.eigsh."""
         from scipy.sparse.linalg import eigsh
-        # Increased mode count to reliably skip 6 rigid body modes in Free-Free
-        n_search = num_modes + 8
-        try:
-            # Sigma=100.0 (near 1.6Hz) to push search away from pure zero RB modes
-            vals, vecs = eigsh(K_s, k=n_search, M=M_s, which='LM', sigma=100.0, tol=1e-5)
-            
-            # Sort by frequency
-            idx = jnp.argsort(vals)
-            vals = vals[idx]
-            vecs = vecs[:, idx]
-            
-            # Convert to Hz
-            freqs = jnp.sqrt(jnp.maximum(vals, 1e-6)) / (2.0 * jnp.pi)
-            
-            # Identify first elastic mode (typically > 1Hz for structural plates/trays)
-            # We return the first 'num_modes' modes starting from the first non-zero mode
-            elastic_mask = (freqs > 1.0)
-            if jnp.any(elastic_mask):
-                first_idx = jnp.where(elastic_mask)[0][0]
-                # Return at most 'num_modes' starting from first elastic
-                res_freqs = freqs[first_idx : first_idx + num_modes]
-                res_vecs = vecs[:, first_idx : first_idx + num_modes]
-                return res_freqs, res_vecs
-            else:
-                return freqs[:num_modes], vecs[:, :num_modes]
-        except Exception as e:
-            # Fallback to standard solve if shift-invert fails
-            return jnp.zeros(num_modes), jnp.zeros((self.total_dof, num_modes))
+        # Shift-invert for reliability
+        vals, vecs = eigsh(K_s, k=num_modes, M=M_s, which='LM', sigma=1.0, tol=1e-5)
+        idx = np.argsort(vals)
+        return jnp.array(vals[idx]), jnp.array(vecs[:, idx])
 
     def compute_field_results(self, u, params, K=None):
         E_nodes = params.get('E', 210000.0)
@@ -605,132 +552,107 @@ class ShellFEM:
         u_f = jnp.array(u).flatten()
         nodes_f = jnp.array(self.nodes)
         
-        # 1. Element-wise properties for accuracy (Standardized for scalar/array)
-        n_tri = self.trias.shape[0]
-        curv_t, eps_t = jnp.zeros((n_tri, 3)), jnp.zeros((n_tri, 3))
-        t_elem_t, E_elem_t = jnp.zeros((n_tri,)), jnp.zeros((n_tri,))
-        
-        if n_tri > 0:
+        curv_t = jnp.zeros((0,3))
+        eps_t = jnp.zeros((0,3))
+        if len(self.trias) > 0:
             curv_t = recover_curvature_tria_bending(u_f, nodes_f, self.trias, 1.0, nu, 1.0)
             eps_m_t = recover_stress_tria_membrane(u_f, nodes_f, self.trias, 1.0, nu)
-            t_elem_t = t_nodes[self.trias].mean(axis=1) if jnp.ndim(t_nodes) > 0 else jnp.full((n_tri,), t_nodes)
-            E_elem_t = E_nodes[self.trias].mean(axis=1) if jnp.ndim(E_nodes) > 0 else jnp.full((n_tri,), E_nodes)
-            eps_t = eps_m_t + curv_t * (t_elem_t[:, None] / 2.0)
+            eps_t = eps_m_t + curv_t * (t_nodes.mean() / 2.0)
             
-        n_quad = self.quads.shape[0]
-        curv_q, eps_q = jnp.zeros((n_quad, 3)), jnp.zeros((n_quad, 3))
-        t_elem_q, E_elem_q = jnp.zeros((n_quad,)), jnp.zeros((n_quad,))
-        
-        if n_quad > 0:
+        curv_q = jnp.zeros((0,3))
+        eps_q = jnp.zeros((0,3))
+        if len(self.quads) > 0:
             curv_q = recover_curvature_quad_bending(u_f, nodes_f, self.quads, 1.0, nu, 1.0)
             eps_m_q = recover_stress_quad_membrane(u_f, nodes_f, self.quads, 1.0, nu)
-            t_elem_q = t_nodes[self.quads].mean(axis=1) if jnp.ndim(t_nodes) > 0 else jnp.full((n_quad,), t_nodes)
-            E_elem_q = E_nodes[self.quads].mean(axis=1) if jnp.ndim(E_nodes) > 0 else jnp.full((n_quad,), E_nodes)
-            eps_q = eps_m_q + curv_q * (t_elem_q[:, None] / 2.0)
+            eps_q = eps_m_q + curv_q * (t_nodes.mean() / 2.0)
             
         eps_el = jnp.concatenate([eps_t, eps_q])
-        E_el = jnp.concatenate([E_elem_t, E_elem_q])
         curv_el = jnp.concatenate([curv_t, curv_q])
-        t_el = jnp.concatenate([t_elem_t, t_elem_q])
         
-        pre_el = E_el / (1 - nu**2)
-        spre_el = E_el / (2 * (1 + nu))
+        E_val = E_nodes.mean()
+        D_val = (E_val * t_nodes.mean()**3) / (12 * (1 - nu**2))
+        pre = E_val / (1 - nu**2)
+        s_pre = E_val / (2 * (1 + nu))
         
-        # 2. Element-wise stress/moment
         sig_el = jnp.stack([
-            pre_el * (eps_el[:,0] + nu * eps_el[:,1]), 
-            pre_el * (eps_el[:,1] + nu * eps_el[:,0]), 
-            spre_el * eps_el[:,2]
+            pre * (eps_el[:,0] + nu * eps_el[:,1]), 
+            pre * (eps_el[:,1] + nu * eps_el[:,0]), 
+            s_pre * eps_el[:,2]
         ], axis=1)
         
-        D_el = (E_el * t_el**3) / (12.0 * (1.0 - nu**2))
         mom_el = jnp.stack([
-            D_el * (curv_el[:,0] + nu * curv_el[:,1]), 
-            D_el * (curv_el[:,1] + nu * curv_el[:,0]), 
-            D_el * 0.5 * (1.0 - nu) * curv_el[:,2]
+            D_val * (curv_el[:,0] + nu * curv_el[:,1]), 
+            D_val * (curv_el[:,1] + nu * curv_el[:,0]), 
+            D_val * 0.5 * (1 - nu) * curv_el[:,2]
         ], axis=1)
         
         vm_el = jnp.sqrt(jnp.maximum(sig_el[:,0]**2 - sig_el[:,0]*sig_el[:,1] + sig_el[:,1]**2 + 3*sig_el[:,2]**2, 1e-12))
-        sed_el = 0.5 * jnp.sum(sig_el * eps_el, axis=1)
+        avg_e = (eps_el[:,0] + eps_el[:,1]) / 2.0
+        r_e = jnp.sqrt(jnp.maximum(((eps_el[:,0] - eps_el[:,1]) / 2.0)**2 + (eps_el[:,2] / 2.0)**2, 1e-12))
         
-        # 3. Nodal Mapping
         stress_node = jnp.zeros(self.num_nodes)
         strain_node = jnp.zeros(self.num_nodes)
-        sed_node = jnp.zeros(self.num_nodes)
         mom_node = jnp.zeros((self.num_nodes, 3))
         count = jnp.zeros(self.num_nodes)
         
-        avg_e = (eps_el[:,0] + eps_el[:,1]) / 2.0
-        r_e = jnp.sqrt(jnp.maximum(((eps_el[:,0] - eps_el[:,1]) / 2.0)**2 + (eps_el[:,2] / 2.0)**2, 1e-12))
-        strain_max_pr = avg_e + r_e
-
-        n_tri = self.trias.shape[0]
-        n_quad = self.quads.shape[0]
-
-        if n_tri > 0:
+        if len(self.trias) > 0:
             ix = self.trias.flatten()
-            stress_node = stress_node.at[ix].add(jnp.repeat(vm_el[:n_tri], 3))
-            strain_node = strain_node.at[ix].add(jnp.repeat(strain_max_pr[:n_tri], 3))
-            sed_node = sed_node.at[ix].add(jnp.repeat(sed_el[:n_tri], 3))
-            
-            # Map Moments (3-component vector)
-            for i in range(3):
-                mom_node = mom_node.at[ix, i].add(jnp.repeat(mom_el[:n_tri, i], 3))
-                
+            stress_node = stress_node.at[ix].add(jnp.repeat(vm_el[:len(self.trias)], 3))
+            strain_node = strain_node.at[ix].add(jnp.repeat(avg_e[:len(self.trias)] + r_e[:len(self.trias)], 3))
             count = count.at[ix].add(1.0)
-            
-        if n_quad > 0:
+            for i in range(3):
+                mom_node = mom_node.at[ix, i].add(jnp.repeat(mom_el[:len(self.trias), i], 3))
+                
+        if len(self.quads) > 0:
             ix = self.quads.flatten()
-            off = n_tri
+            off = len(self.trias)
             stress_node = stress_node.at[ix].add(jnp.repeat(vm_el[off:], 4))
-            strain_node = strain_node.at[ix].add(jnp.repeat(strain_max_pr[off:], 4))
-            sed_node = sed_node.at[ix].add(jnp.repeat(sed_el[off:], 4))
-            
-            # Map Moments
+            strain_node = strain_node.at[ix].add(jnp.repeat(avg_e[off:] + r_e[off:], 4))
+            count = count.at[ix].add(1.0)
             for i in range(3):
                 mom_node = mom_node.at[ix, i].add(jnp.repeat(mom_el[off:, i], 4))
                 
-            count = count.at[ix].add(1.0)
-
         safe_c = jnp.maximum(count, 1.0)
         return {
             'stress_vm': stress_node / safe_c, 
             'strain_max_principal': strain_node / safe_c, 
-            'sed_node': sed_node / safe_c,
-            'moments': mom_node / safe_c[:, None],
             'u_mag': jnp.linalg.norm(u_f.reshape(-1,6)[:,:3], axis=1), 
             'eps_el': eps_el, 
             'sig_el': sig_el, 
-            'vm_el': vm_el,
-            'sed_el': sed_el
+            'moments': mom_node / safe_c[:,None],
+            'stress_vm_el': vm_el,
+            'stress_x_el': sig_el[:, 0],
+            'strain_x_el': eps_el[:, 0]
         }
 
-    def compute_strain_energy_density(self, u, params, field_results=None, **kwargs):
-        """Compute SED. Optimized with nodal mapping in compute_field_results."""
-        if field_results is None:
-            field_results = self.compute_field_results(u, params)
-        return field_results['sed_node']
+    def compute_strain_energy_density(self, u, params, K=None):
+        res = self.compute_field_results(u, params)
+        sed_el = 0.5 * jnp.sum(res['sig_el'] * res['eps_el'], axis=1)
+        sed_node = jnp.zeros(self.num_nodes)
+        count = jnp.zeros(self.num_nodes)
+        if len(self.trias) > 0:
+            sed_node = sed_node.at[self.trias.flatten()].add(jnp.repeat(sed_el[:len(self.trias)], 3))
+            count = count.at[self.trias.flatten()].add(1.0)
+        if len(self.quads) > 0:
+            off = len(self.trias)
+            sed_node = sed_node.at[self.quads.flatten()].add(jnp.repeat(sed_el[off:], 4))
+            count = count.at[self.quads.flatten()].add(1.0)
+        return sed_node / jnp.maximum(count, 1.0)
 
-    def compute_max_surface_stress(self, u, params, field_results=None, **kwargs):
-        """Return Von-Mises stress. Optimized with field_results cache."""
-        if field_results is None:
-            field_results = self.compute_field_results(u, params)
-        return field_results['stress_vm']
+    def compute_max_surface_stress(self, u, params, K=None):
+        return self.compute_field_results(u, params)['stress_vm']
 
-    def compute_max_surface_strain(self, u, params, field_results=None, **kwargs):
-        """Return Max Principal strain. Optimized with field_results cache."""
-        if field_results is None:
-            field_results = self.compute_field_results(u, params)
-        return field_results['strain_max_principal']
+    def compute_max_surface_strain(self, u, params, K=None):
+        return self.compute_field_results(u, params)['strain_max_principal']
 
-    def compute_moment(self, u, params, **kwargs):
+    def compute_moment(self, u, params, K=None):
         return self.compute_field_results(u, params)['moments']
 
     def solve_static_partitioned(self, K, F, free_dofs, prescribed_dofs, prescribed_vals):
         K_ff = K[jnp.ix_(free_dofs, free_dofs)]
         K_fp = K[jnp.ix_(free_dofs, prescribed_dofs)]
         rhs = F[free_dofs] - K_fp @ prescribed_vals
-        u_f = jax.scipy.linalg.solve(K_ff + 1e-9*jnp.eye(free_dofs.shape[0]), rhs, assume_a='pos')
+        u_f = jax.scipy.linalg.solve(K_ff + 1e-9*jnp.eye(len(free_dofs)), rhs, assume_a='pos')
         u = jnp.zeros(self.total_dof)
         u = u.at[free_dofs].set(u_f).at[prescribed_dofs].set(prescribed_vals)
         return u
