@@ -140,7 +140,6 @@ class PatchTestRunner:
         
         # Get Analytical Field
         theory = analytical.kirchhoff_plate_field_solution(L, L, q, E, t, nu, nodes[:,0], nodes[:,1])
-        
         # 1. Displacement Field
         fe_w = np.abs(u[2::6]); th_w = np.abs(theory['w'])
         w_max_err = abs(np.max(fe_w) - np.max(th_w))/np.max(th_w)*100
@@ -197,7 +196,7 @@ class PatchTestRunner:
         mode_indices = [(1,1), (1,2), (2,1), (2,2), (1,3)]
         results = []
         for i, (m, n) in enumerate(mode_indices):
-            fe_f = np.sqrt(max(valid_vals[i], 0.0)) / (2*np.pi) if len(valid_vals) > i else 0.0
+            fe_f = valid_vals[i] if len(valid_vals) > i else 0.0
             th_f = analytical.kirchhoff_frequency(L, L, E, t, nu, rho, m, n)
             results.append(TestResult(f"Frequency Mode {i+1}", f"({m},{n}) [Hz]", element_type, th_f, fe_f, abs(fe_f-th_f)/th_f*100, 5.0))
         return results

@@ -193,9 +193,9 @@ def recover_curvature_quad_bending(u, nodes, quads, E, nu, t):
         tx_l = tx_g * e1[0] + ty_g * e1[1]
         ty_l = tx_g * e2[0] + ty_g * e2[1]
         
-        kx = jnp.dot(dn_dx, ty_l)
-        ky = -jnp.dot(dn_dy, tx_l)
-        kxy = jnp.dot(dn_dy, ty_l) - jnp.dot(dn_dx, tx_l)
+        kx = -jnp.dot(dn_dx, ty_l)
+        ky = jnp.dot(dn_dy, tx_l)
+        kxy = -(jnp.dot(dn_dy, ty_l) - jnp.dot(dn_dx, tx_l))
         return jnp.array([kx, ky, kxy])
     return vmap(get_curvature)(jnp.arange(quads.shape[0]))
 
@@ -518,26 +518,25 @@ class ShellFEM:
     def assemble_sparse(self, params):
         return self.assemble(params, sparse=True)
 
-    def solve_eigen(self, K, M, num_modes=10):
+    def solve_eigen(self, K, M, num_modes=10, num_skip=0):
         m_diag = jnp.maximum(jnp.diag(M), 1e-15)
         m_inv_sqrt = 1.0 / jnp.sqrt(m_diag)
         K_sym = (K + K.T) / 2.0
         A = K_sym * m_inv_sqrt[:,None] * m_inv_sqrt[None,:] + jnp.eye(K.shape[0])*1e-10
         
-        # Request more modes to identify and skip 6 RB modes
-        n_search = num_modes + 8
+        # Request more modes if skip is requested
+        n_search = num_modes + num_skip + 2
         vals, vecs = safe_eigh(A)
         # vals and vecs are already sorted in safe_eigh
         
-        # Convert to Hz for filtering
+        # Convert to Hz
         freqs = jnp.sqrt(jnp.maximum(vals, 0.0)) / (2 * jnp.pi)
         vecs_phys = vecs * m_inv_sqrt[:,None]
         
-        # Skip 6 rigid body modes for free-free mechanical analysis
-        # Total number of DOFs: 6*n_nodes. RBMs are modes 0-5.
-        rbm_skip = 6
-        res_freqs = freqs[rbm_skip : rbm_skip + num_modes]
-        res_vecs = vecs_phys[:, rbm_skip : rbm_skip + num_modes]
+        # Skip rigid body modes if requested (num_skip > 0)
+        # For free-free analysis, num_skip=6 is typical
+        res_freqs = freqs[num_skip : num_skip + num_modes]
+        res_vecs = vecs_phys[:, num_skip : num_skip + num_modes]
         return res_freqs, res_vecs
 
     def solve_static(self, params, F, prescribed_dofs, prescribed_vals, sparse=False):
@@ -566,14 +565,17 @@ class ShellFEM:
         u[pd] = pv
         return jnp.array(u)
 
-    def solve_eigen_sparse(self, K_s, M_s, num_modes=12):
+    def solve_eigen_sparse(self, K_s, M_s, num_modes=12, sigma=None):
         """Solve generalized eigen problem using scipy.sparse.linalg.eigsh."""
         from scipy.sparse.linalg import eigsh
-        # Increased mode count to reliably skip 6 rigid body modes in Free-Free
-        n_search = num_modes + 8
+        n_search = min(num_modes + 6, self.total_dof - 2)
         try:
-            # Sigma=100.0 (near 1.6Hz) to push search away from pure zero RB modes
-            vals, vecs = eigsh(K_s, k=n_search, M=M_s, which='LM', sigma=100.0, tol=1e-5)
+            # If sigma is None, default to SM (Smallest Magnitude) which correctly finds RBMs as ~0
+            # If sigma is provided (e.g. 100.0), it targets specific frequency ranges
+            if sigma is None:
+                vals, vecs = eigsh(K_s, k=n_search, M=M_s, which='SM', tol=1e-5)
+            else:
+                vals, vecs = eigsh(K_s, k=n_search, M=M_s, which='LM', sigma=sigma, tol=1e-5)
             
             # Sort by frequency
             idx = jnp.argsort(vals)
@@ -581,21 +583,15 @@ class ShellFEM:
             vecs = vecs[:, idx]
             
             # Convert to Hz
-            freqs = jnp.sqrt(jnp.maximum(vals, 1e-6)) / (2.0 * jnp.pi)
+            freqs = jnp.sqrt(jnp.maximum(vals, 1e-10)) / (2.0 * jnp.pi)
             
-            # Identify first elastic mode (typically > 1Hz for structural plates/trays)
-            # We return the first 'num_modes' modes starting from the first non-zero mode
-            elastic_mask = (freqs > 1.0)
-            if jnp.any(elastic_mask):
-                first_idx = jnp.where(elastic_mask)[0][0]
-                # Return at most 'num_modes' starting from first elastic
-                res_freqs = freqs[first_idx : first_idx + num_modes]
-                res_vecs = vecs[:, first_idx : first_idx + num_modes]
-                return res_freqs, res_vecs
-            else:
-                return freqs[:num_modes], vecs[:, :num_modes]
+            # We no longer hard-filter for freqs > 1.0 globally in this method.
+            # Filtering or skipping should be handled by the caller or specialized methods.
+            return freqs[:num_modes], vecs[:, :num_modes]
         except Exception as e:
             # Fallback to standard solve if shift-invert fails
+            import traceback
+            traceback.print_exc()
             return jnp.zeros(num_modes), jnp.zeros((self.total_dof, num_modes))
 
     def compute_field_results(self, u, params, K=None):
@@ -702,7 +698,15 @@ class ShellFEM:
             'eps_el': eps_el, 
             'sig_el': sig_el, 
             'vm_el': vm_el,
-            'sed_el': sed_el
+            'sed_el': sed_el,
+            # Aliases for Verification Suite compatibility
+            'stress_vm_el': vm_el,
+            'stress_x_el': sig_el[:,0],
+            'stress_y_el': sig_el[:,1],
+            'stress_xy_el': sig_el[:,2],
+            'strain_x_el': eps_el[:,0],
+            'strain_y_el': eps_el[:,1],
+            'strain_xy_el': eps_el[:,2]
         }
 
     def compute_strain_energy_density(self, u, params, field_results=None, **kwargs):
