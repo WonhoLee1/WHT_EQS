@@ -1,0 +1,7 @@
+- [x] Integrate Bathe's MITC3 philosophy (Planning)
+- [ ] [Fix] Implement True Edge-Tangential Shear Tying in _get_B_mitc3
+- [ ] [Fix] Update compute_mitc3_local:
+    - Reduce alpha to 1e-4
+    - Fix potential double-permutation in Kb_perm
+- [ ] [Fix] Audit recover_curvature_tria_bending for sign consistency
+- [ ] [Verify] Run verification_runner.py

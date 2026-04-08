@@ -19,6 +19,20 @@
 | **ISSUE-011** | 2026-04-08 | 고유진동수 최적화 정체 (3.2Hz) | `gt_init_scale` 상향(0.5) 및 `max_iterations`(200) 증설로 비드 형성을 강제 유도하여 강성 보강 효과를 확보함. |
 | **ISSUE-012** | 2026-04-08 | JAX Tracer 제어 흐름 오류 (`TracerBoolConversionError`) | Solver의 `assemble` 및 `solve_eigen` 내 Python `if`문을 `jnp.where` 및 고정 인덱싱으로 리팩토링하여 JIT 호환성 확보. |
 | **ISSUE-013** | 2026-04-08 | 굽힘 곡률 부호 불일치 (`Curvature Sign`) | `_B_bending_q4`와 `recover_curvature` 간의 부호를 일치시켜 물리적 정합성을 완성함. |
+| **ISSUE-014** | 2026-04-09 | 최적화 모니터링 가시성 부족 | 루프 출력 형식을 2행으로 개편하고 타겟 값을 상단에 명시적으로 노출함. |
+| **ISSUE-015** | 2026-04-09 | 초기 해 정합성 의심 (Freq mismatch) | 최적화 시작 전 GT와 초기 모델의 상태를 비교하는 진단 리포트 로직을 추가함. |
+| **ISSUE-016** | 2026-04-09 | Tray 형상의 수치적 불안정성 | [결과] 안정화 성공 (ISSUE-017로 보완됨). |
+| **ISSUE-017** | 2026-04-09 | 3D Tray (H=50mm) 메쉬 통합 | `generate_tray_mesh_quads` 복구 및 3D 응력 복원 로직 정합성 확보 완료. |
+| **ISSUE-018** | 2026-04-09 | JAX-Scipy `griddata` 이터레이터 충돌 | `pts_h`/`pts_l`을 실제 노드 좌표로 매핑하고 NumPy 캐스팅을 강제하여 최적화 셋업 안정화. |
+| **ISSUE-019** | 2026-04-09 | `effective_weights` 미정의 (`NameError`) | 존재하지 않는 변수 `effective_weights`를 `loss_weights`로 교체. |
+| **ISSUE-020** | 2026-04-09 | `best_loss`/`best_params`/`wait` 미초기화 | 루프 진입 전 `best_loss=inf`, `best_params=params copy`, `wait=0`, `self.history=[]` 초기화 추가. |
+| **ISSUE-021** | 2026-04-09 | `auto_scale` 파라미터 미정의 (`NameError`) | `optimize` 메서드 시그니처에 `auto_scale=True` 매개변수 추가. |
+| **ISSUE-022** | 2026-04-09 | JIT 컴파일된 `loss_vg` 미사용 (매 반복 재컴파일) | 루프 내부에서 `jax.value_and_grad(loss_fn, ...)` 직접 호출을 사전 컴파일된 `loss_vg` 호출로 교체하여 성능 대폭 개선. |
+| **ISSUE-023** | 2026-04-09 | `jit` 미임포트 (`NameError`) | `import jax`만 존재하는 상태에서 `jit(...)` 호출. `jax.jit(...)`로 수정. |
+| **ISSUE-024** | 2026-04-09 | `verify()` 키 불일치 (`KeyError: max_surface_stress`) | 타겟 딕셔너리는 `max_stress`/`max_strain` 사용하는데, verify에서 `max_surface_stress`/`max_surface_strain`으로 참조. 키 이름 통일. |
+| **ISSUE-025** | 2026-04-09 | `solve_eigen_sparse` 미지원 인자 (`sigma`) | `verify()`에서 존재하지 않는 `sigma=100.0` 키워드 인자 전달. 제거하여 해결. |
+| **ISSUE-026** | 2026-04-09 | 이중 주파수 변환 (`sqrt/2π` 중복 적용) | `solve_eigen_sparse`가 이미 Hz를 반환하는데, `generate_targets`와 `verify`에서 다시 `sqrt/2π` 변환 적용. 전체 파이프라인에서 중복 변환 제거하여 물리적 정합성 복원. |
+| **ISSUE-027** | 2026-04-09 | `compute_moment` 미구현 (`AttributeError`) | `ShellFEM`에 존재하지 않는 `compute_moment` 메서드 호출. 반력 모멘트 성분(Mx, My)을 활용한 근사 모멘트 산출로 대체. |
 
 ## 2. 주의 사항 및 가이드 (Lessons Learned)
 
