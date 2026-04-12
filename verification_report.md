@@ -1,5 +1,5 @@
 # 📊 Professional Structural Optimization Verification Report
-**Date:** 2026-04-09 04:08:46
+**Date:** 2026-04-10 03:38:01
 **Domain:** 1450.0mm x 850.0mm | **Material:** E=210000.0MPa, v=0.3
 **Resolution:** Target(48x28) vs. Optimized(24x14)
 
@@ -16,62 +16,62 @@ Detailed comparison of peak structural responses across all load cases.
 | Load Case | Metric | Target Result | Optimized Result | Error (%) | Status |
 | :--- | :--- | :---: | :---: | :---: | :---: |
 | twist_x    | Max Disp   |     11.129 mm |     11.129 mm |     0.00% |   ✔    |
-| twist_x    | Max Reac   |    785.914 N |    777.202 N |     1.11% |   ✔    |
-| twist_x    | Max Moment |  13039.773 Nmm |  13250.767 Nmm |     1.62% |   ✔    |
+| twist_x    | Max Reac   |   7885.092 N |   1553.095 N |    80.30% |   ⚠    |
+| twist_x    | Max Moment |  15164.106 Nmm |   9746.622 Nmm |    35.73% |   ⚠    |
 | ---------- | ---------- | ------------ | ------------ | ---------- | ------ |
 | twist_y    | Max Disp   |     18.985 mm |     18.985 mm |     0.00% |   ✔    |
-| twist_y    | Max Reac   |  31181.123 N |  31177.904 N |     0.01% |   ✔    |
-| twist_y    | Max Moment | 7957639.403 Nmm | 7957444.858 Nmm |     0.00% |   ✔    |
+| twist_y    | Max Reac   |  31164.665 N |  31129.408 N |     0.11% |   ✔    |
+| twist_y    | Max Moment | 7968949.585 Nmm | 7110812.208 Nmm |    10.77% |   ⚠    |
 | ---------- | ---------- | ------------ | ------------ | ---------- | ------ |
-| bend_y     | Max Disp   |      1.041 mm |      1.043 mm |     0.20% |   ✔    |
-| bend_y     | Max Reac   |    203.943 N |    184.605 N |     9.48% |   ⚠    |
-| bend_y     | Max Moment |   8167.741 Nmm |   7825.956 Nmm |     4.18% |   ✔    |
+| bend_y     | Max Disp   |      1.034 mm |      1.038 mm |     0.43% |   ✔    |
+| bend_y     | Max Reac   |   1570.492 N |    222.026 N |    85.86% |   ⚠    |
+| bend_y     | Max Moment |  31237.902 Nmm |   9991.245 Nmm |    68.02% |   ⚠    |
 | ---------- | ---------- | ------------ | ------------ | ---------- | ------ |
-| bend_x     | Max Disp   |      1.063 mm |      1.388 mm |    30.56% |   ⚠    |
-| bend_x     | Max Reac   |    197.761 N |    202.269 N |     2.28% |   ✔    |
-| bend_x     | Max Moment |  10990.482 Nmm |   9900.732 Nmm |     9.92% |   ⚠    |
+| bend_x     | Max Disp   |      1.011 mm |      1.006 mm |     0.47% |   ✔    |
+| bend_x     | Max Reac   |    130.118 N |    313.636 N |   141.04% |   ⚠    |
+| bend_x     | Max Moment |  10652.391 Nmm |  17383.818 Nmm |    63.19% |   ⚠    |
 | ---------- | ---------- | ------------ | ------------ | ---------- | ------ |
 | lift_br    | Max Disp   |      5.000 mm |      5.000 mm |     0.00% |   ✔    |
-| lift_br    | Max Reac   |     80.177 N |     79.467 N |     0.89% |   ✔    |
-| lift_br    | Max Moment |      0.000 Nmm |      0.000 Nmm |    57.44% |   ⚠    |
+| lift_br    | Max Reac   |     98.466 N |     88.040 N |    10.59% |   ⚠    |
+| lift_br    | Max Moment |      0.000 Nmm |      0.000 Nmm |    42.45% |   ⚠    |
 | ---------- | ---------- | ------------ | ------------ | ---------- | ------ |
 | lift_tl    | Max Disp   |      5.000 mm |      5.000 mm |     0.00% |   ✔    |
-| lift_tl    | Max Reac   |     70.541 N |     69.695 N |     1.20% |   ✔    |
-| lift_tl    | Max Moment |      0.000 Nmm |      0.000 Nmm |    60.00% |   ⚠    |
+| lift_tl    | Max Reac   |    100.846 N |     78.549 N |    22.11% |   ⚠    |
+| lift_tl    | Max Moment |      0.000 Nmm |      0.000 Nmm |    50.22% |   ⚠    |
 | ---------- | ---------- | ------------ | ------------ | ---------- | ------ |
 | lift_tl_br | Max Disp   |      5.000 mm |      5.000 mm |     0.00% |   ✔    |
-| lift_tl_br | Max Reac   |     93.211 N |     92.510 N |     0.75% |   ✔    |
-| lift_tl_br | Max Moment |   1838.466 Nmm |   1832.696 Nmm |     0.31% |   ✔    |
+| lift_tl_br | Max Reac   |    118.124 N |    102.663 N |    13.09% |   ⚠    |
+| lift_tl_br | Max Moment |   1977.884 Nmm |   1823.697 Nmm |     7.80% |   ⚠    |
 | ---------- | ---------- | ------------ | ------------ | ---------- | ------ |
 
 
 ## 3. 📈 Correlation Statistics
 | Load Case | Similarity Index | R² (Disp) | MSE (Disp) | Result Status |
 | :--- | :---: | :---: | :---: | :---: |
-| twist_x    |           98.50% |     0.9836 |   1.11e-01 | ✔ EXCELLENT  |
-| twist_y    |           97.94% |     0.9790 |   6.12e-01 | ✔ EXCELLENT  |
-| bend_y     |           91.77% |     0.8917 |   7.34e-03 |      OK      |
-| bend_x     |           59.63% |    -0.8421 |   2.66e-01 |    ❌ FAIL    |
-| lift_br    |           99.35% |     0.9935 |   1.06e-03 | ✔ EXCELLENT  |
-| lift_tl    |           99.47% |     0.9978 |   7.11e-04 | ✔ EXCELLENT  |
-| lift_tl_br |           99.73% |     0.9978 |   1.82e-04 | ✔ EXCELLENT  |
+| twist_x    |           95.16% |     0.8391 |   1.16e+00 |    ❌ FAIL    |
+| twist_y    |           93.71% |     0.6164 |   5.70e+00 |    ❌ FAIL    |
+| bend_y     |           87.25% |     0.4103 |   1.74e-02 |    ❌ FAIL    |
+| bend_x     |           93.17% |     0.8941 |   4.77e-03 |      OK      |
+| lift_br    |           96.38% |    -0.3195 |   3.28e-02 |    ❌ FAIL    |
+| lift_tl    |           94.40% |    -2.2852 |   7.83e-02 |    ❌ FAIL    |
+| lift_tl_br |           95.88% |    -0.4621 |   4.24e-02 |    ❌ FAIL    |
 
 
 ## 4. 🎵 Dynamic Modal Performance
 | Mode No. | Target Freq (Hz) | Opt Freq (Hz) | Error (%) | MAC Value | Status |
 | :---: | :---: | :---: | :---: | :---: | :---: |
-|    1     |           25.55 |        22.31 |    12.69% |    0.7961 | ⚠ CHECK |
-|    2     |           28.38 |        23.58 |    16.91% |    0.8983 | ⚠ CHECK |
-|    3     |           29.45 |        25.76 |    12.54% |    0.8135 | ⚠ CHECK |
-|    4     |           38.78 |        31.61 |    18.48% |    0.8800 | ⚠ CHECK |
-|    5     |           41.59 |        36.28 |    12.77% |    0.8287 | ⚠ CHECK |
+|    1     |          130.26 |        62.21 |    52.24% |    0.4274 | ⚠ CHECK |
+|    2     |          149.57 |        72.19 |    51.74% |    0.0111 | ⚠ CHECK |
+|    3     |          156.78 |        83.45 |    46.77% |    0.2050 | ⚠ CHECK |
+|    4     |          186.93 |        87.36 |    53.27% |    0.0941 | ⚠ CHECK |
+|    5     |          195.38 |       104.08 |    46.73% |    0.1693 | ⚠ CHECK |
 
 
 ## 5. 📐 Geometry Accuracy
 | Parameter | RMSE | Correlation | Mean (Target) | Mean (Opt) |
 | :--- | :---: | :---: | :---: | :---: |
 | Thickness (t) |   0.5267 |      0.0000 |      1.219 |    1.000 |
-| Topography (z) |   5.0707 |      0.2312 |      3.222 |    2.749 |
+| Topography (z) |   4.1013 |      0.7627 |      3.222 |    1.639 |
 
 
 ---

@@ -172,7 +172,7 @@ class EquivalentSheetModel:
             res_fields = {
                 'displacement_vec': np.array(u),
                 'stress_vm': np.array(f_res['stress_vm']),
-                'strain_equiv': np.array(f_res['strain_equiv_nodal']),
+                'strain_x': np.array(f_res['strain_x']),
                 'sed': np.array(f_res['sed'])
             }
             res = StructuralResult(res_fields, np.array(self.fem_high.nodes), fem_high.elements)
@@ -185,7 +185,7 @@ class EquivalentSheetModel:
                 'u_full': np.array(u),
                 'reaction_full': np.array(R_residual),
                 'max_stress': np.array(f_res['stress_vm']),
-                'max_strain': np.array(f_res['strain_equiv_nodal']),
+                'max_strain': np.array(f_res['strain_x']),
                 'strain_energy_density': np.array(f_res['sed']),
                 'params': self.target_params_high,
                 'fixed_dofs': np.array(fixed_dofs),
@@ -207,8 +207,8 @@ class EquivalentSheetModel:
                     'u_static': np.array(u[2::6]),
                     'stress_vm': np.array(f_res['stress_vm']),
                     'max_stress': np.array(f_res['stress_vm']),
-                    'strain_equiv': np.array(f_res['strain_equiv_nodal']),
-                    'max_strain': np.array(f_res['strain_equiv_nodal']),
+                    'strain_x': np.array(f_res['strain_x']),
+                    'max_strain': np.array(f_res['strain_x']),
                     'sed': np.array(f_res['sed']),
                     'strain_energy_density': np.array(f_res['sed'])
                 },
@@ -230,35 +230,22 @@ class EquivalentSheetModel:
         xh, yh = np.linspace(0, self.fem.Lx, Nx_h+1), np.linspace(0, self.fem.Ly, Ny_h+1)
         
         for i, target in enumerate(self.targets):
-            # Row 0: Displacement (Nodal)
+            # Row 0: Displacement
             data_w = target['u_static'].reshape(Ny_h+1, Nx_h+1)
             im0 = axes[0, i].contourf(xh, yh, data_w, 30, cmap='jet')
             axes[0, i].set_title(f"Case: {target['case_name']}\nMax Disp: {np.max(np.abs(data_w)):.3f}mm", fontsize=8)
             axes[0, i].set_aspect('equal')
             plt.colorbar(im0, ax=axes[0, i], shrink=0.7)
             
-            # Row 1/2: Max Surface Stress/Strain
-            # These can be nodal (if averaged) or elemental (if raw).
-            # We already have nodal averages in 'max_stress' and 'max_strain' keys.
-            s_field = target['max_stress']
-            e_field = target['max_strain']
-            
-            # Ensure we can reshape (project back to grid if necessary)
-            size_expected = (Nx_h+1)*(Ny_h+1)
-            if s_field.size == size_expected and e_field.size == size_expected:
-                data_s = s_field.reshape(Ny_h+1, Nx_h+1)
-                data_e = e_field.reshape(Ny_h+1, Nx_h+1) * 1000 # to microstrain
-            else:
-                # Fallback: if size doesn't match nodal grid, just plot max as text or skip contour
-                print(f" [WARN] Field sizes (S:{s_field.size}, E:{e_field.size}) don't match grid {size_expected}. Skipping contour.")
-                data_s = np.zeros((Ny_h+1, Nx_h+1))
-                data_e = np.zeros((Ny_h+1, Nx_h+1))
-
+            # Row 1: Max Surface Stress
+            data_s = target['max_stress'].reshape(Ny_h+1, Nx_h+1)
             im1 = axes[1, i].contourf(xh, yh, data_s, 30, cmap='jet')
             axes[1, i].set_title(f"Max Stress: {np.max(data_s):.2f} MPa", fontsize=8)
             axes[1, i].set_aspect('equal')
             plt.colorbar(im1, ax=axes[1, i], shrink=0.7)
             
+            # Row 2: Max Surface Strain
+            data_e = target['max_strain'].reshape(Ny_h+1, Nx_h+1) * 1000 # to microstrain/e-3
             im2 = axes[2, i].contourf(xh, yh, data_e, 30, cmap='jet')
             axes[2, i].set_title(f"Max Strain: {np.max(data_e):.3f} e-3", fontsize=8)
             axes[2, i].set_aspect('equal')
@@ -1508,8 +1495,8 @@ class EquivalentSheetModel:
             M_y_tgt = np.sum(np.abs(R_full_tgt[4::6]))
             max_mom_tgt = np.sqrt(M_x_tgt**2 + M_y_tgt**2)
 
-            # Calculate for Optimized (JAX Sparse Matmul)
-            R_full_opt = np.array(K_opt @ jnp.array(u_opt)) - np.array(F)
+            # Calculate for Optimized (Sparse Dot)
+            R_full_opt = K_opt.dot(np.array(u_opt)) - np.array(F)
             max_force_z_opt = np.max(np.abs(R_full_opt[2::6]))
             M_x_opt = np.sum(np.abs(R_full_opt[3::6]))
             M_y_opt = np.sum(np.abs(R_full_opt[4::6]))
@@ -1537,8 +1524,6 @@ class EquivalentSheetModel:
 
             # Disp
             levels_w = np.linspace(np.min(w_ref), np.max(w_ref), 30)
-            min_w, max_w = float(np.min(w_ref)), float(np.max(w_ref))
-            levels_w = np.linspace(min_w, max_w if max_w > min_w + 1e-12 else min_w + 1e-12, 30)
             plot_field(axes[0,0], w_ref, "Target Disp (mm)", levels=levels_w, cmap='jet')
             plot_field(axes[0,1], w_opt, "Optimized Disp (mm)", levels=levels_w, cmap='jet')
             plot_field(axes[0,2], np.abs(w_opt - w_ref), "Error (mm)", cmap='YlOrRd')
@@ -1753,15 +1738,15 @@ class EquivalentSheetModel:
             w_ref, w_opt = tgt['u_static'], u_opt[2::6]
             max_w_ref, max_w_opt = np.max(np.abs(w_ref)), np.max(np.abs(w_opt))
             
-            # 2. Reaction Forces (at fixed DOFs) - JAX Sparse Matmul
-            R_vec_ref = (np.array(K_opt @ jnp.array(u_ref)) - np.array(F_ext))[2::6] # Simplified Z-component reactions
-            R_vec_opt = (np.array(K_opt @ jnp.array(u_opt)) - np.array(F_ext))[2::6]
+            # 2. Reaction Forces (at fixed DOFs) - Sparse Dot
+            R_vec_ref = (K_opt.dot(np.array(u_ref)) - np.array(F_ext))[2::6] # Simplified Z-component reactions
+            R_vec_opt = (K_opt.dot(np.array(u_opt)) - np.array(F_ext))[2::6]
             max_R_ref, max_R_opt = np.max(np.abs(tgt['reaction_full'][2::6])), np.max(np.abs(R_vec_opt))
             
             # 3. Bending Moments (Approximated from reaction force moments)
             # compute_moment is not available in ShellFEM; use reaction Mx/My as proxy
             R_full_ref = np.array(tgt['reaction_full'])
-            R_full_opt = np.array(K_opt @ jnp.array(u_opt)) - np.array(F_ext)
+            R_full_opt = K_opt.dot(np.array(u_opt)) - np.array(F_ext)
             max_M_ref = np.sqrt(np.sum(R_full_ref[3::6]**2) + np.sum(R_full_ref[4::6]**2))
             max_M_opt = np.sqrt(np.sum(R_full_opt[3::6]**2) + np.sum(R_full_opt[4::6]**2))
             
@@ -2019,3 +2004,4 @@ if __name__ == '__main__':
         import traceback
         traceback.print_exc()
         print(f"\n[CRITICAL ERROR] Optimization failed: {e}")
+

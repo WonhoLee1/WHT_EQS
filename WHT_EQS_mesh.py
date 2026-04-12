@@ -22,11 +22,14 @@ def get_nodes_in_box(node_coords, x_range=None, y_range=None, z_range=None):
     mask = np.ones(len(node_coords), dtype=bool)
     
     if x_range is not None:
-        mask &= (node_coords[:, 0] >= x_range[0]) & (node_coords[:, 0] <= x_range[1])
+        if x_range[0] is not None: mask &= (node_coords[:, 0] >= x_range[0])
+        if x_range[1] is not None: mask &= (node_coords[:, 0] <= x_range[1])
     if y_range is not None:
-        mask &= (node_coords[:, 1] >= y_range[0]) & (node_coords[:, 1] <= y_range[1])
+        if y_range[0] is not None: mask &= (node_coords[:, 1] >= y_range[0])
+        if y_range[1] is not None: mask &= (node_coords[:, 1] <= y_range[1])
     if z_range is not None:
-        mask &= (node_coords[:, 2] >= z_range[0]) & (node_coords[:, 2] <= z_range[1])
+        if z_range[0] is not None: mask &= (node_coords[:, 2] >= z_range[0])
+        if z_range[1] is not None: mask &= (node_coords[:, 2] <= z_range[1])
         
     return np.where(mask)[0]
 

@@ -108,23 +108,67 @@ def _get_B_bending_t3(nodes):
     return Bb
 
 def compute_mitc3_local(E, t, nu, rho, x2d, y2d):
-    detJ = (x2d[1]-x2d[0])*(y2d[2]-y2d[0]) - (x2d[2]-x2d[0])*(y2d[1]-y2d[0])
-    area = 0.5*jnp.abs(detJ); G = E/(2*(1+nu))
-    Dm = (E*t/(1-nu**2))*jnp.array([[1,nu,0],[nu,1,0],[0,0,(1-nu)/2]])
-    invJ = 1.0/detJ; dn_dx = invJ*jnp.array([y2d[1]-y2d[2], y2d[2]-y2d[0], y2d[0]-y2d[1]])
-    dn_dy = invJ*jnp.array([x2d[2]-x2d[1], x2d[0]-x2d[2], x2d[1]-x2d[0]])
-    Bm = jnp.zeros((3,6)); idx=jnp.arange(3); Bm=Bm.at[0,2*idx].set(dn_dx).at[1,2*idx+1].set(dn_dy).at[2,2*idx].set(dn_dy).at[2,2*idx+1].set(dn_dx)
-    Db = (E*t**3/(12*(1-nu**2)))*jnp.array([[1,nu,0],[nu,1,0],[0,0,(1-nu)/2]])
-    nodes2d=jnp.stack([x2d,y2d],1)
+    """
+    MITC3 (Mixed Interpolation of Tensorial Components) 3-node triangular shell element.
+    Standardized Rotation Mapping: theta_x = dw/dy, theta_y = -dw/dx
+    Local DOFs: [u, v, w, beta_x, beta_y, tz] where beta_x = -dw/dx, beta_y = -dw/dy
+    Mapping: beta_x = thy, beta_y = -thx
+    """
+    det_jac = (x2d[1]-x2d[0])*(y2d[2]-y2d[0]) - (x2d[2]-x2d[0])*(y2d[1]-y2d[0])
+    area = 0.5 * jnp.abs(det_jac)
+    G = E / (2 * (1 + nu))
+    
+    # 1. Membrane [u, v]
+    Dm = (E*t/(1-nu**2)) * jnp.array([[1, nu, 0], [nu, 1, 0], [0, 0, (1-nu)/2]])
+    invJ = 1.0 / det_jac
+    dn_dx = invJ * jnp.array([y2d[1]-y2d[2], y2d[2]-y2d[0], y2d[0]-y2d[1]])
+    dn_dy = invJ * jnp.array([x2d[2]-x2d[1], x2d[0]-x2d[2], x2d[1]-x2d[0]])
+    Bm = jnp.zeros((3, 6))
+    idx = jnp.arange(3)
+    Bm = Bm.at[0, 2*idx].set(dn_dx).at[1, 2*idx+1].set(dn_dy).at[2, 2*idx].set(dn_dy).at[2, 2*idx+1].set(dn_dx)
+    Km = (Bm.T @ Dm @ Bm) * area
+
+    # 2. Bending [w, beta_x, beta_y]
+    Db = (E*t**3/(12*(1-nu**2))) * jnp.array([[1, nu, 0], [nu, 1, 0], [0, 0, (1-nu)/2]])
+    nodes2d = jnp.stack([x2d, y2d], 1)
+    
+    # Bending B-matrix (DKT-like mapping for curvature)
     Bb = _get_B_bending_t3(nodes2d)
     Kb = (Bb.T @ Db @ Bb) * area
+    
+    # Shear B-matrix (MITC3 covariant)
     Bs, _ = _get_B_mitc3(nodes2d, t, nu)
-    Ks = (Bs.T @ (5/6*G*t*jnp.eye(2)) @ Bs)*area
-    K_local = jnp.zeros((18,18)); m_p = jnp.array([0,1, 6,7, 12,13]); b_p = jnp.array([2,3,4, 8,9,10, 14,15,16])
-    K_local = K_local.at[jnp.ix_(m_p,m_p)].set(Bm.T@Dm@Bm*area).at[jnp.ix_(b_p,b_p)].set(Kb+Ks).at[jnp.array([5,11,17]),jnp.array([5,11,17])].add(1e-7*G*t*area)
-    m_n = rho*area*t/3.0; Ir = m_n*(t**2)/12.0
-    M_local = jnp.diag(jnp.tile(jnp.array([m_n,m_n,m_n,Ir,Ir,Ir*0.01]), 3))
-    return K_local, M_local
+    Ks = (Bs.T @ (5/6 * G * t * jnp.eye(2)) @ Bs) * area
+    K_bend_shear = Kb + Ks
+
+    # 3. Assemble and Apply Rotation Mapping (T_rot)
+    # Global [w, thx, thy] -> Local [w, beta_x, beta_y]
+    # beta_x = thy, beta_y = -thx
+    T_rot = jnp.array([[1.0, 0.0, 0.0],
+                       [0.0, 0.0, 1.0],
+                       [0.0,-1.0, 0.0]])
+    
+    K_full = jnp.zeros((18, 18))
+    m_p = jnp.array([0, 1, 6, 7, 12, 13])
+    b_p = jnp.array([2, 3, 4, 8, 9, 10, 14, 15, 16])
+    
+    # Local Bending/Shear logic uses [w, beta_x, beta_y]
+    # We transform it to [w, thx, thy] for global assembly
+    Te_b = jsl.block_diag(T_rot, T_rot, T_rot)
+    K_glob_bend = Te_b.T @ K_bend_shear @ Te_b
+    
+    K_full = K_full.at[jnp.ix_(m_p, m_p)].set(Km)
+    K_full = K_full.at[jnp.ix_(b_p, b_p)].set(K_glob_bend)
+    
+    # Drilling Stabilization
+    K_full = K_full.at[jnp.array([5, 11, 17]), jnp.array([5, 11, 17])].add(1e-7 * G * t * area)
+    
+    # 4. Mass Matrix
+    m_n = rho * area * t / 3.0
+    Ir = m_n * (t**2) / 12.0
+    M_full = jnp.diag(jnp.tile(jnp.array([m_n, m_n, m_n, Ir, Ir, Ir*0.01]), 3))
+    
+    return K_full, M_full
 
 def compute_mitc4_local(E, t, nu, rho, p2d):
     C_m = (E*t/(1-nu**2))*jnp.array([[1,nu,0],[nu,1,0],[0,0,(1-nu)/2]])
@@ -148,11 +192,25 @@ def compute_mitc4_local(E, t, nu, rho, p2d):
     return K_l, M_local
 
 def recover_curvature_tria_bending(u, nodes, trias, E, nu, t):
+    """
+    Recover curvature from triangular shell elements using standardized rotation mapping.
+    Matches global [w, thx, thy] to MITC3 curvature.
+    """
     def get_c(i):
-        ix = trias[i]; u_e = u.reshape(-1,6)[ix]
-        # Mindlin mapping [w1, thx1, thy1, ...]
-        ud = u_e[:, 2:5].flatten()
-        return _get_B_bending_t3(nodes[ix]) @ ud
+        ix = trias[i]
+        u_e = u.reshape(-1, 6)[ix]
+        # Global rotations [thx, thy] -> Local Curvature DOFs [beta_x, beta_y]
+        # Mapping: beta_x = thy, beta_y = -thx
+        w_val = u_e[:, 2]
+        thx = u_e[:, 3]
+        thy = u_e[:, 4]
+        
+        # Local bending DOFs: [w1, beta_x1, beta_y1, ...]
+        ud_local = jnp.stack([w_val, thy, -thx], axis=1).flatten()
+        
+        # Bending B-matrix for T3 (mapped to [w, beta_x, beta_y])
+        return _get_B_bending_t3(nodes[ix][:, :2]) @ ud_local
+    
     return vmap(get_c)(jnp.arange(trias.shape[0]))
 
 def recover_curvature_quad_bending(u, nodes, quads, E, nu, t):
@@ -210,6 +268,27 @@ class ShellFEM:
         else: self.quad_dof_idx = None
         if self.trias.shape[0] > 0: self.tria_dof_idx = jnp.array([np.concatenate([np.arange(6)+n*6 for n in e]) for e in np.array(self.trias)])
         else: self.tria_dof_idx = None
+        self._cached_indices = None
+
+    def _prepare_assembly_cache(self):
+        """[PERFORMANCE] Pre-calculate assembly indices for BCOO-like speed in JAX."""
+        indices = []
+        if self.quads.shape[0] > 0:
+            I, J = jnp.repeat(jnp.arange(24), 24), jnp.tile(jnp.arange(24), 24)
+            Gi = self.quad_dof_idx[:, I].flatten()
+            Gj = self.quad_dof_idx[:, J].flatten()
+            indices.append(jnp.stack([Gi, Gj], axis=1))
+        
+        if self.trias.shape[0] > 0:
+            I, J = jnp.repeat(jnp.arange(18), 18), jnp.tile(jnp.arange(18), 18)
+            Gi = self.tria_dof_idx[:, I].flatten()
+            Gj = self.tria_dof_idx[:, J].flatten()
+            indices.append(jnp.stack([Gi, Gj], axis=1))
+            
+        if indices:
+            self._cached_indices = jnp.concatenate(indices, axis=0)
+        else:
+            self._cached_indices = jnp.zeros((0, 2), dtype=jnp.int32)
 
     def assemble(self, params, sparse=False):
         n_n = self.nodes.shape[0]; E = jnp.atleast_1d(jnp.array(params.get('E', 210000.0))); t = jnp.atleast_1d(jnp.array(params.get('t', 1.0)))
@@ -285,22 +364,32 @@ class ShellFEM:
         vm_el = jnp.sqrt(jnp.maximum(sig_el[:,0]**2-sig_el[:,0]*sig_el[:,1]+sig_el[:,1]**2+3*sig_el[:,2]**2, 1e-12))
         
         # Nodal averaging for visualization
-        vm_nodal = jnp.zeros(self.num_nodes); eps_x_nodal = jnp.zeros(self.num_nodes); sed_nodal = jnp.zeros(self.num_nodes); count = jnp.zeros(self.num_nodes);
+        vm_nodal = jnp.zeros(self.num_nodes); eps_x_nodal = jnp.zeros(self.num_nodes); eq_nodal = jnp.zeros(self.num_nodes); count = jnp.zeros(self.num_nodes);
         
-        # Consistent Strain Energy Density (SED)
-        # For simplicity in this stabilization phase, we use the element-wise average approximation u_e^T K_e u_e / Area_e
-        # In a real shell solver, this would be computed at Gauss points.
-        sed_el = jnp.zeros(n_t + n_q) # Placeholder for now, can be improved
+        # Element-wise equivalent strain proxy
+        eq_el = vm_el / E_el # [N_elem]
         
-        if n_t>0: ix=self.trias.flatten(); vm_nodal=vm_nodal.at[ix].add(jnp.repeat(vm_el[:n_t],3)); eps_x_nodal=eps_x_nodal.at[ix].add(jnp.repeat(eps_top[:n_t,0],3)); count=count.at[ix].add(1)
-        if n_q>0: ix=self.quads.flatten(); vm_nodal=vm_nodal.at[ix].add(jnp.repeat(vm_el[n_t:],4)); eps_x_nodal=eps_x_nodal.at[ix].add(jnp.repeat(eps_top[n_t:,0],4)); count=count.at[ix].add(1)
+        if n_t>0:
+            ix=self.trias.flatten()
+            vm_nodal=vm_nodal.at[ix].add(jnp.repeat(vm_el[:n_t],3))
+            eps_x_nodal=eps_x_nodal.at[ix].add(jnp.repeat(eps_top[:n_t,0],3))
+            eq_nodal=eq_nodal.at[ix].add(jnp.repeat(eq_el[:n_t],3))
+            count=count.at[ix].add(1)
+        if n_q>0:
+            ix=self.quads.flatten()
+            vm_nodal=vm_nodal.at[ix].add(jnp.repeat(vm_el[n_t:],4))
+            eps_x_nodal=eps_x_nodal.at[ix].add(jnp.repeat(eps_top[n_t:,0],4))
+            eq_nodal=eq_nodal.at[ix].add(jnp.repeat(eq_el[n_t:],4))
+            count=count.at[ix].add(1)
         
         return {
             'stress_vm': vm_nodal/jnp.maximum(count,1), 
             'strain_x': eps_x_nodal/jnp.maximum(count,1),
+            'strain_equiv_nodal': eq_nodal/jnp.maximum(count,1),
             'stress_vm_el': vm_el, 
             'strain_x_el': eps_top[:,0],
-            'sed': vm_nodal/jnp.maximum(count,1) * 1e-4, # Proxy for SED in nodal view
+            'strain_equiv_el': eq_el, # Elemental for direct reference
+            'sed': vm_nodal/jnp.maximum(count,1) * 1e-4, 
             'u_mag': jnp.linalg.norm(u_f.reshape(-1,6)[:,:3], axis=1)
         }
 

@@ -10,6 +10,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, '..'))
 
 from ShellFemSolverVerification.patch_tests import PatchTestRunner, TestResult
+import ShellFemSolverVerification.scaling_report as scaling
 
 def print_results_table(results: List[TestResult]) -> None:
     SEP = "=" * 115
@@ -23,7 +24,7 @@ def print_results_table(results: List[TestResult]) -> None:
     print(SEP)
 
     hdr = (f"  {'Test Identification':<42s} {'Quantity':<22s} {'Theory':>12s} "
-           f"{'FEM':>12s} {'Err%':>8s}  Result")
+           f"{'FEM':>12s} {'Err%':>8s} {'Time':>8s} Result")
     print(hdr)
     print(sep)
 
@@ -32,7 +33,7 @@ def print_results_table(results: List[TestResult]) -> None:
         status = "PASS" if r.passed else "FAIL"
         line = (f"  {r.name + ' (' + r.element_type + ')':<42s} {r.quantity:<22s} "
                 f"{r.theory:>12.5g} {r.fem:>12.5g} "
-                f"{r.error_pct:>7.3f}%  [{status}]")
+                f"{r.error_pct:>7.3f}% {r.exec_time_ms:>7.1f}ms [{status}]")
         # Ensure ASCII output for safety on Windows CP949
         print(line.encode('ascii', 'replace').decode('ascii'))
         if r.passed: n_pass += 1
@@ -41,7 +42,7 @@ def print_results_table(results: List[TestResult]) -> None:
     print(f"  Final Master Score: {n_pass}/{len(results)} PASS (Strict Engineering Standard)")
     print(SEP)
 
-def generate_markdown_report(results: List[TestResult], out_path: str) -> None:
+def generate_markdown_report(results: List[TestResult], out_path: str, scaling_data: str = "") -> None:
     now = datetime.datetime.now()
     lines = [
         "# ShellFEM Solver Final Master Fidelity Report",
@@ -51,29 +52,41 @@ def generate_markdown_report(results: List[TestResult], out_path: str) -> None:
         "",
         "## 1. Consolidated Results Matrix",
         "",
-        "| Test Case | Elem | Quantity | Theory | FEM | Error(%) | Result |",
-        "|-----------|------|----------|--------|-----|----------|--------|",
+        "| Test Case | Elem | Quantity | Theory | FEM | Error(%) | Time(ms) | Result |",
+        "|-----------|------|----------|--------|-----|----------|----------|--------|",
     ]
     for r in results:
         status = "PASS" if r.passed else "FAIL"
         row = (f"| {r.name} | {r.element_type} | {r.quantity} "
                f"| {r.theory:.5g} | {r.fem:.5g} "
-               f"| {r.error_pct:.3f} | {status} |")
+               f"| {r.error_pct:.3f} | {r.exec_time_ms:.1f} | {status} |")
         lines.append(row)
 
+    total_time = sum(r.exec_time_ms for r in results)
     lines += [
         "",
         "---",
         "",
-        "## 2. Engineering Analysis",
+        "## 2. Performance Analysis",
         "",
-        "### 2.1. Q4 Twist Error (Mindlin-Reissner Effect)",
+        f"- **Total Combined EXEC Time**: {total_time:.2f} ms",
+        "- **Average Solve Time per Case**: " + f"{total_time/len(results):.2f} ms" if results else "N/A",
+        "- **Acceleration Tech**: JAX Sparse Adjoint + COO Index Caching",
+        "",
+        "### 2.1. Solver Scalability",
+        "The current benchmarking suite uses small-scale patch tests (11x11 to 21x21 meshes). Performance on these scales is dominated by JIT compilation overhead on the first run.",
+        "",
+        "## 3. Engineering Analysis",
+        "",
+        "### 3.1. Q4 Twist Error (Mindlin-Reissner Effect)",
         "Q4 elements exhibit ~3% error in pure twisting. This is expected as Q4 includes transverse shear effects.",
         "",
-        "### 2.2. T3 (DKT) Performance",
+        "### 3.2. T3 (DKT) Performance",
         "DKT elements should ideally show < 1% error in bending. Significant discrepancies indicate formulation or BC issues.",
         "",
-        "## 3. Conclusion",
+        scaling_data,
+        "",
+        "## 6. Conclusion",
         "Verification suite execution completed.",
         "",
         "---",
@@ -111,8 +124,11 @@ def main():
 
     print_results_table(results_all)
     
+    # Run Multi-Core Scaling Benchmark
+    scaling_info = scaling.generate_scaling_report()
+    
     report_path = os.path.join(_HERE, "results", "master_fidelity_report_final.md")
-    generate_markdown_report(results_all, report_path)
+    generate_markdown_report(results_all, report_path, scaling_info)
     print(f"\n[MASTER REPORT ISSUED] {report_path}")
 
 if __name__ == "__main__":

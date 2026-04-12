@@ -8,7 +8,6 @@ import numpy as np
 from scipy.interpolate import griddata
 import matplotlib.pyplot as plt
 import os
-import sys
 import msvcrt
 import datetime
 import pickle
@@ -17,9 +16,8 @@ import pickle
 from ShellFemSolver.shell_solver import ShellFEM
 from ShellFemSolver.mesh_utils import generate_rect_mesh_quads, generate_tray_mesh_quads
 from WHT_EQS_analysis import PlateFEM, StructuralResult
-from opt_targets import ResultBundle, Mode, apply_case_targets_from_spec, map_legacy_flags_to_targets, OptTarget
 from WHT_EQS_pattern_generator import get_thickness_field, get_z_field
-from WHT_EQS_load_cases import TwistCase, PureBendingCase, CornerLiftCase, TwoCornerLiftCase, CantileverCase, PressureCase
+from WHT_EQS_load_cases import TwistCase, PureBendingCase, CornerLiftCase, TwoCornerLiftCase
 from WHT_EQS_visualization import (
     stage1_visualize_patterns,
     stage2_visualize_ground_truth,
@@ -37,16 +35,12 @@ class EquivalentSheetModel:
         self.fem = PlateFEM(Lx, Ly, nx, ny) # 호환성 함수 호출 (ShellFEM)
         self.cases = []
         self.targets = []
-        self.targets_bundles = []
         self.resolution_high = (50, 20)
         self.target_mass = 0.0
         self.target_start_idx = 6 # Default for Free-Free
         self.optimized_params = None
         self.target_params_high = None
         self.config = {}
-        
-        # [PERFORMANCE] Pre-calculate assembly indices for high-speed JAX execution
-        self.fem.fem._prepare_assembly_cache()
 
     def add_case(self, case):
         self.cases.append(case)
@@ -71,10 +65,10 @@ class EquivalentSheetModel:
 
         # --- Cache Check ---
         use_cache = False
-        if cache_file and os.environ.get("NON_INTERACTIVE"):
+        if os.environ.get("NON_INTERACTIVE"):
             use_cache = os.path.exists(cache_file)
             print(f"[NON-INTERACTIVE] File exists: {use_cache}. Loading if possible.")
-        elif cache_file and os.path.exists(cache_file):
+        elif os.path.exists(cache_file):
             print(f"\n[CACHE DETECTED] Found existing Ground Truth data: {cache_file}")
             while True:
                 choice = input("Do you want to load from cache? [y/N]: ").strip().upper()
@@ -161,64 +155,28 @@ class EquivalentSheetModel:
             free_dofs = np.setdiff1d(np.arange(fem_high.total_dof), fixed_dofs)
             u = fem_high.solve_static_sparse(K_h, F, free_dofs, fixed_dofs, fixed_vals)
             
-            # Compute Detailed Field Results (Stress, Strain, SED)
-            f_res = fem_high.compute_field_results(u, self.target_params_high)
-            
-            # Compute Full Reaction Forces (Sparse Dot) for optimization matching
-            F_int = K_h @ jnp.array(u)
+            # Compute Full Reaction Forces (Sparse Dot)
+            F_int = K_h.dot(np.array(u))
             R_residual = F_int - np.array(F)
-            
-            # Create StructuralResult for ParaView export
-            res_fields = {
-                'displacement_vec': np.array(u),
-                'stress_vm': np.array(f_res['stress_vm']),
-                'strain_equiv': np.array(f_res['strain_equiv_nodal']),
-                'sed': np.array(f_res['sed'])
-            }
-            res = StructuralResult(res_fields, np.array(self.fem_high.nodes), fem_high.elements)
-            res.save_vtkhdf(f"gt_static_{case.name}.vtkhdf")
             
             target = {
                 'case_name': case.name,
                 'weight': case.weight,
-                'u_static': np.array(u[2::6]), 
-                'u_full': np.array(u),
-                'reaction_full': np.array(R_residual),
-                'max_stress': np.array(f_res['stress_vm']),
-                'max_strain': np.array(f_res['strain_equiv_nodal']),
-                'strain_energy_density': np.array(f_res['sed']),
+                'u_static': np.array(u[2::6]), # W-displacement only
+                'u_full': np.array(u),         # Full 6-DOF displacement
+                'reaction_full': np.array(R_residual), # Full reaction force vector
+                'max_stress': np.array(fem_high.compute_max_surface_stress(u, self.target_params_high)),
+                'max_strain': np.array(fem_high.compute_max_surface_strain(u, self.target_params_high)),
+                'strain_energy_density': np.array(fem_high.compute_strain_energy_density(u, self.target_params_high)),
                 'params': self.target_params_high,
-                'fixed_dofs': np.array(fixed_dofs),
-                'force_vector': np.array(F)
+                'fixed_dofs': np.array(fixed_dofs), # Store BCs for visualization
+                'force_vector': np.array(F)         # Store Loads for visualization
             }
+            
+            u_w = np.array(u[2::6])
+            print(f"    [RESULT] Max Disp: {float(np.max(np.abs(u_w))):.4f} mm, Max Stress: {float(np.max(target['max_stress'])):.2f} MPa")
+            
             self.targets.append(target)
-            # Also create a structured ResultBundle for downstream OptTarget use
-            # Build node displacement dict (node_id -> [u,v,w])
-            node_disp_dict = {}
-            num_nodes = fem_high.nodes.shape[0]
-            u_full = np.array(u)
-            for n in range(num_nodes):
-                node_disp_dict[n] = u_full[n*6 : n*6+3]
-
-            rbemap = {'residual': np.array(R_residual)}
-            bundle = ResultBundle(
-                fields={
-                    'displacement_vec': np.array(u),
-                    'u_static': np.array(u[2::6]),
-                    'stress_vm': np.array(f_res['stress_vm']),
-                    'max_stress': np.array(f_res['stress_vm']),
-                    'strain_equiv': np.array(f_res['strain_equiv_nodal']),
-                    'max_strain': np.array(f_res['strain_equiv_nodal']),
-                    'sed': np.array(f_res['sed']),
-                    'strain_energy_density': np.array(f_res['sed'])
-                },
-                rbe_reactions=rbemap,
-                node_disps=node_disp_dict,
-                mass=float(self.target_mass),
-                modes=[],
-                meta={'params': self.target_params_high, 'units': {'stress_vm': 'MPa', 'disp': 'mm', 'rbe_reaction': 'N'}}
-            )
-            self.targets_bundles.append(bundle)
                 
         # --- NEW: Generate Summary Ground Truth Plot (Moved Outside Loop) ---
         print("\nGenerating Ground Truth Summary Plot (3xN)...")
@@ -230,35 +188,22 @@ class EquivalentSheetModel:
         xh, yh = np.linspace(0, self.fem.Lx, Nx_h+1), np.linspace(0, self.fem.Ly, Ny_h+1)
         
         for i, target in enumerate(self.targets):
-            # Row 0: Displacement (Nodal)
+            # Row 0: Displacement
             data_w = target['u_static'].reshape(Ny_h+1, Nx_h+1)
             im0 = axes[0, i].contourf(xh, yh, data_w, 30, cmap='jet')
             axes[0, i].set_title(f"Case: {target['case_name']}\nMax Disp: {np.max(np.abs(data_w)):.3f}mm", fontsize=8)
             axes[0, i].set_aspect('equal')
             plt.colorbar(im0, ax=axes[0, i], shrink=0.7)
             
-            # Row 1/2: Max Surface Stress/Strain
-            # These can be nodal (if averaged) or elemental (if raw).
-            # We already have nodal averages in 'max_stress' and 'max_strain' keys.
-            s_field = target['max_stress']
-            e_field = target['max_strain']
-            
-            # Ensure we can reshape (project back to grid if necessary)
-            size_expected = (Nx_h+1)*(Ny_h+1)
-            if s_field.size == size_expected and e_field.size == size_expected:
-                data_s = s_field.reshape(Ny_h+1, Nx_h+1)
-                data_e = e_field.reshape(Ny_h+1, Nx_h+1) * 1000 # to microstrain
-            else:
-                # Fallback: if size doesn't match nodal grid, just plot max as text or skip contour
-                print(f" [WARN] Field sizes (S:{s_field.size}, E:{e_field.size}) don't match grid {size_expected}. Skipping contour.")
-                data_s = np.zeros((Ny_h+1, Nx_h+1))
-                data_e = np.zeros((Ny_h+1, Nx_h+1))
-
+            # Row 1: Max Surface Stress
+            data_s = target['max_stress'].reshape(Ny_h+1, Nx_h+1)
             im1 = axes[1, i].contourf(xh, yh, data_s, 30, cmap='jet')
             axes[1, i].set_title(f"Max Stress: {np.max(data_s):.2f} MPa", fontsize=8)
             axes[1, i].set_aspect('equal')
             plt.colorbar(im1, ax=axes[1, i], shrink=0.7)
             
+            # Row 2: Max Surface Strain
+            data_e = target['max_strain'].reshape(Ny_h+1, Nx_h+1) * 1000 # to microstrain/e-3
             im2 = axes[2, i].contourf(xh, yh, data_e, 30, cmap='jet')
             axes[2, i].set_title(f"Max Strain: {np.max(data_e):.3f} e-3", fontsize=8)
             axes[2, i].set_aspect('equal')
@@ -278,39 +223,24 @@ class EquivalentSheetModel:
         print(f" -> Unified Standard: Skipping 6 RBMs. Target Mode 1 is index {start_idx} ({all_freqs_h[start_idx]:.2f} Hz)")
 
         self.target_start_idx = start_idx
-        freqs_save = vals[start_idx : start_idx + num_modes_save]
-        modes_save = vecs[:, start_idx : start_idx + num_modes_save] # Full 6-DOF
-        
         self.target_eigen = {
-            'vals': np.array(freqs_save),
-            'modes': np.array(modes_save[2::6, :]) # W-component for internal loss
+            'vals': vals[start_idx : start_idx + num_modes_save],
+            'modes': vecs[2::6, start_idx : start_idx + num_modes_save] # W-component
         }
-        
-        # --- NEW: Export Modal Results to Temporal VTKHDF ---
-        print("\nExporting Ground Truth Modal Analysis to ParaView...")
-        modal_res = StructuralResult({}, np.array(self.fem_high.nodes), fem_high.elements)
-        steps_dict = {
-            'values': freqs_save,
-            'point_data': {
-                'mode_shape_vec': [modes_save[:, i] for i in range(num_modes_save)]
-            }
-        }
-        modal_res.save_vtkhdf("gt_modal_results.vtkhdf", steps_dict=steps_dict)
         
         # Save to cache
-        if cache_file:
-            print(f"Saving Ground Truth to cache ({cache_file})...")
-            cache_data = {
-                'target_params_high': self.target_params_high,
-                'target_mass': self.target_mass,
-                'targets': self.targets,
-                'target_eigen': self.target_eigen
-            }
-            try:
-                with open(cache_file, 'wb') as f:
-                    pickle.dump(cache_data, f)
-            except Exception as e:
-                print(f"[WARNING] Failed to save cache: {e}")
+        print(f"Saving Ground Truth to cache ({cache_file})...")
+        cache_data = {
+            'target_params_high': self.target_params_high,
+            'target_mass': self.target_mass,
+            'targets': self.targets,
+            'target_eigen': self.target_eigen
+        }
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(cache_data, f)
+        except Exception as e:
+            print(f"[WARNING] Failed to save cache: {e}")
 
         # target_eigen['vals'] are already in Hz
         target_freqs = np.array(self.target_eigen['vals'])
@@ -319,27 +249,25 @@ class EquivalentSheetModel:
         # [STAGE 2] Results Visualization
         stage2_visualize_ground_truth(fem_high, self.targets, self.target_params_high, eigen_data=self.target_eigen)
 
-    def optimize(self, opt_config, loss_weights,
-                 use_bead_smoothing=False,
-                 use_strain_energy=True,
-                 use_surface_stress=True,
+    def optimize(self, opt_config, loss_weights, 
+                 use_bead_smoothing=False, 
+                 use_strain_energy=True, 
+                 use_surface_stress=True, 
                  use_surface_strain=True,
-                 use_mass_constraint=True,
+                 use_mass_constraint=True, 
                  mass_tolerance=0.05,
-                 max_iterations=200,
-                 use_early_stopping=True,
-                 early_stop_patience=30,
+                 max_iterations=200, 
+                 use_early_stopping=True, 
+                 early_stop_patience=100, 
                  early_stop_tol=1e-8,
                  learning_rate=0.3,
                  num_modes_loss=None,
                  min_bead_width=150.0,
                  mac_search_window=2,
                  mode_match_type='hybrid',
-                 mode_freq_weight=0.0,
                  init_pz_from_gt=False,
                  gt_init_scale=1.0,
-                 auto_scale=False,
-                 eigen_freq=20):
+                 auto_scale=True):
         """
         [위상 최적화 (Topography Optimization) 수행기]
 
@@ -355,12 +283,11 @@ class EquivalentSheetModel:
         - mass_tolerance      : 타겟 모델 대비 허용되는 최대 질량 오차율 (예: 0.05 = 5%). 넘어갈 시 거대한 페널티 부과.
         - max_iterations      : JAX 옵티마이저(Adam)가 수행할 최대 반복(런) 횟수.
         - use_early_stopping  : 손실값이 개선되지 않을 때 조기에 최적화를 종료할지 여부.
-        - early_stop_patience : 손실값이 개선되지 않는 상태를 몇 번의 반복 횟수까지 봐줄 것인지 (예: 30번). [최적화: 기본값 100→30]
+        - early_stop_patience : 손실값이 개선되지 않는 상태를 몇 번의 반복 횟수까지 봐줄 것인지 (예: 100번).
         - early_stop_tol      : 손실값 비교 시 유의미한 개선이라고 판단할 최소 변화량 오차 한계.
         - learning_rate       : Adam 옵티마이저의 최대 학습률 (Cosine Decay로 점진적으로 스케줄링됨).
         - num_modes_loss      : 주파수 및 MAC 손실 함수에 반영할 모드의 개수 (None이면 타겟 모드 개수와 동일).
         - min_bead_width      : use_bead_smoothing이 True일 때, 비드의 최소 폭(mm). (기본 추천값: 150.0mm 이상)
-
         - mac_search_window   : 모드 추적(Mode Tracking) 시 몇 번째까지 이웃한 모드들과 MAC를 비교하여 형태를 찾을지 결정.
         - mode_match_type     : 모드 형상 비교 방식 설정 ('mac', 'direct', 'hybrid'). 
                                 'mac': 각도 기반 비교 (기울기 소실 우려), 
@@ -369,8 +296,6 @@ class EquivalentSheetModel:
         - init_pz_from_gt     : [NEW 옵션] 최적화 초기 형상(pz_init)을 타겟 Ground Truth 형상으로 덮어쓸지 여부.
                                 (초기부터 비슷한 형태를 갖추고 시작하여 로컬 미니마 탈출 및 빠른 수렴 가능)
         - gt_init_scale       : init_pz_from_gt=True 시, 타겟 변위를 얼마나 가져올지에 대한 곱셈 비율 (기본 1.0 = 100%)
-        - auto_scale          : 초기 손실 함수 자동 가중치 스케일링 여부. False면 사용자 설정 가중치 직접 사용 [최적화: True→False]
-        - eigen_freq          : 주파수/모드 손실 계산 주기(반복 수). 10=10번마다 한 번 계산, 나머지는 캐시 사용. [최적화: 신규 추가]
         """
                  
         print("\n" + "="*70)
@@ -382,21 +307,6 @@ class EquivalentSheetModel:
         
         Nx_l, Ny_l = self.fem.nx, self.fem.ny
         pts_l = self.fem.node_coords[:, :2]  # X,Y only for griddata
-
-        # --- PoC: Evaluate any OptTargets attached to cases using ResultBundle ---
-        if hasattr(self, 'targets_bundles') and len(self.targets_bundles) > 0:
-            print("\n[PoC] Evaluating case OptTargets against stored ResultBundles")
-            for i, case in enumerate(self.cases):
-                if getattr(case, 'opt_targets', None):
-                    try:
-                        bundle = self.targets_bundles[i]
-                    except IndexError:
-                        print(f"  - Case {case.name}: no matching ResultBundle (skip)")
-                        continue
-                    for t_idx, ot in enumerate(case.opt_targets):
-                        err, details = ot.compute_error(bundle, ref_bundle=bundle)
-                        print(f"  - Case {case.name} Target#{t_idx}: err={err:.6e}, details={details}")
-
         
         # [NEW] Save optimization configuration for later use (e.g., in verify())
         self.config = {
@@ -404,16 +314,6 @@ class EquivalentSheetModel:
             'num_modes_loss': num_modes_loss,
             'use_bead_smoothing': use_bead_smoothing
         }
-
-        # Map legacy boolean flags to OptTarget instances (attach to cases/global)
-        map_legacy_flags_to_targets(self,
-                        use_surface_stress=use_surface_stress,
-                        use_surface_strain=use_surface_strain,
-                        use_strain_energy=use_strain_energy,
-                        use_mass_constraint=use_mass_constraint,
-                        mode_weight=loss_weights.get('mode', 0.0),
-                        num_modes=num_modes_loss,
-                        freq_weight=mode_freq_weight)
         
         # 1. Interpolate High-Res Targets to Low-Res Mesh
         Nx_h, Ny_h = self.resolution_high
@@ -564,136 +464,67 @@ class EquivalentSheetModel:
             fd, fv, F = case.get_bcs(self.fem)
             case_bcs.append({'fd': fd, 'fv': fv, 'F': F, 'free': jnp.setdiff1d(jnp.arange(self.fem.total_dof), fd)})
 
-        # --- Aggregate OptTarget weights into loss-category constants ---
-        opt_w = {
-            'static': 0.0,
-            'stress': 0.0,
-            'strain': 0.0,
-            'energy': 0.0,
-            'reaction': 0.0,
-            'mode': 0.0,
-            'mass': 0.0
-        }
-        from opt_targets import TargetType
-        for ci, case in enumerate(self.cases):
-            cweight = getattr(case, 'weight', 1.0)
-            for ot in getattr(case, 'opt_targets', []) or []:
-                w = float(getattr(ot, 'weight', 1.0)) * float(cweight)
-                t = ot.target_type
-                if t == TargetType.FIELD_STAT:
-                    # map field choices to categories
-                    field = getattr(ot, 'field', '')
-                    if field and 'stress' in field:
-                        opt_w['stress'] += w
-                    elif field and 'strain' in field:
-                        opt_w['strain'] += w
-                    else:
-                        opt_w['static'] += w
-                elif t == TargetType.RBE_REACTION:
-                    opt_w['reaction'] += w
-                elif t == TargetType.NODE_DISP:
-                    opt_w['static'] += w
-                elif t == TargetType.MODES:
-                    opt_w['mode'] += w
-                elif t == TargetType.MASS:
-                    opt_w['mass'] += w
-
-        # --- Build JAX-evaluable target descriptors for in-loss evaluation ---
-        # Each descriptor references a case index and contains minimal data for JAX ops.
-        targets_jax = []
-        for ci, case in enumerate(self.cases):
-            for ot in getattr(case, 'opt_targets', []) or []:
-                desc = {'case_idx': ci, 'type': ot.target_type.value, 'weight': float(getattr(ot, 'weight', 1.0))}
-                # map fields to existing target arrays (targets_low)
-                if ot.target_type == TargetType.FIELD_STAT:
-                    fld = getattr(ot, 'field', '') or ''
-                    if 'stress' in fld:
-                        desc['ref_key'] = 'max_stress'
-                    elif 'strain' in fld:
-                        desc['ref_key'] = 'max_strain'
-                    elif 'sed' in fld or 'energy' in fld:
-                        desc['ref_key'] = 'strain_energy_density'
-                    else:
-                        desc['ref_key'] = 'u_static'
-                    desc['reduction'] = ot.reduction.value
-                    desc['compare_mode'] = ot.compare_mode.value
-                elif ot.target_type == TargetType.RBE_REACTION:
-                    desc['ref_key'] = 'reaction_sums'
-                    desc['component'] = getattr(ot, 'component', None)
-                    desc['compare_mode'] = ot.compare_mode.value
-                elif ot.target_type == TargetType.MODES:
-                    desc['compare_mode'] = ot.compare_mode.value
-                    desc['num_modes'] = getattr(ot, 'num_modes', None)
-                    desc['freq_weight'] = float(getattr(ot, 'freq_weight', 0.0))
-                elif ot.target_type == TargetType.MASS:
-                    desc['ref_value'] = float(ot.ref_value) if ot.ref_value is not None else float(self.target_mass)
-                    desc['compare_mode'] = ot.compare_mode.value
-                targets_jax.append(desc)
-
-        # Include any global targets attached to model (e.g., mass, modal)
-        for ot in getattr(self, 'global_opt_targets', []) or []:
-            desc = {'case_idx': None, 'type': ot.target_type.value, 'weight': float(getattr(ot, 'weight', 1.0))}
-            if ot.target_type == TargetType.FIELD_STAT:
-                fld = getattr(ot, 'field', '') or ''
-                if 'stress' in fld:
-                    desc['ref_key'] = 'max_stress'
-                elif 'strain' in fld:
-                    desc['ref_key'] = 'max_strain'
-                elif 'sed' in fld or 'energy' in fld:
-                    desc['ref_key'] = 'strain_energy_density'
-                else:
-                    desc['ref_key'] = 'u_static'
-                desc['reduction'] = ot.reduction.value
-                desc['compare_mode'] = ot.compare_mode.value
-            elif ot.target_type == TargetType.RBE_REACTION:
-                desc['ref_key'] = 'reaction_sums'
-                desc['component'] = getattr(ot, 'component', None)
-                desc['compare_mode'] = ot.compare_mode.value
-            elif ot.target_type == TargetType.MODES:
-                desc['compare_mode'] = ot.compare_mode.value
-                desc['num_modes'] = getattr(ot, 'num_modes', None)
-                desc['freq_weight'] = float(getattr(ot, 'freq_weight', 0.0))
-            elif ot.target_type == TargetType.MASS:
-                desc['ref_value'] = float(ot.ref_value) if ot.ref_value is not None else float(self.target_mass)
-                desc['compare_mode'] = ot.compare_mode.value
-            targets_jax.append(desc)
-
-
-        def loss_fn(p_scaled, fixed_p_scaled, freqs=None, vecs=None, loss_weights=None):
+        def loss_fn(p_scaled, fixed_p_scaled):
             # Use captured scaling_consts (constants in JIT)
             combined_phys = {k: v * scaling_consts[k] for k, v in p_scaled.items()}
             for k, v in fixed_p_scaled.items(): combined_phys[k] = v * scaling_consts[k]
-
-            # Prepare flattened parameters for FEM assembly and analysis calls
+            
+            # Special case for 'z' calculation from 'pz' (Topography)
+            if 'pz' in combined_phys:
+                pz_val = combined_phys['pz']
+                if pz_val.ndim == 1 and pz_val.shape[0] == 1: # Global PZ
+                    combined_phys['z'] = jnp.full((Ny_l+1, Nx_l+1), pz_val[0])
+                elif filter_kernel is not None:
+                    # [IMPROVED] Use reflect padding to prevent boundary dampening artifacts
+                    pad_h, pad_w = filter_kernel.shape[0]//2, filter_kernel.shape[1]//2
+                    pz_padded = jnp.pad(pz_val, ((pad_h, pad_h), (pad_w, pad_w)), mode='reflect')
+                    combined_phys['z'] = jax.scipy.signal.convolve2d(pz_padded, filter_kernel, mode='valid')
+                else:
+                    combined_phys['z'] = pz_val
+            
+            # Prepare flattened parameters for FEM assembly/analysis
             def broadcast_nodal(val):
+                # If scalar (global), broadcast to (num_nodes,)
                 if val.ndim == 1 and val.shape[0] == 1:
                     return jnp.full(((Ny_l+1)*(Nx_l+1),), val[0])
                 return val.flatten()
 
             p_fem = {k: broadcast_nodal(v) for k, v in combined_phys.items() if k != 'pz'}
+            
             K, M = self.fem.assemble(p_fem)
-            p_actual = p_fem  # Use flattened version for analysis calls
-
-            # collect per-case computed fields so we can evaluate all OptTargets after solving each case
-            per_u = []
-            per_w = []
-            per_max_stress = []
-            per_max_strain = []
-            per_sed = []
-            per_reaction_sums = []
-
+            p_actual = p_fem # Use flattened version for analysis calls
+            l_static, l_stress, l_strain, l_energy, l_reaction, l_freq, l_mode, l_mass, l_reg = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            
             for i, case in enumerate(self.cases):
                 b = case_bcs[i]
                 u = self.fem.solve_static_partitioned(K, b['F'], b['free'], b['fd'], b['fv'])
                 w = u[2::6]
+                
+                # [SPEED OPTIMIZATION] Compute field results once per load case
+                # This avoids 3x redundant FEM logic calls for stress, strain, and energy
                 f_res = self.fem.compute_field_results(u, p_actual)
-
-                # store proxies for later descriptor evaluation
-                per_u.append(self.targets_low[i]['u_static'])
-                per_w.append(w)
-                per_max_stress.append(self.fem.compute_max_surface_stress(u, p_actual, field_results=f_res))
-                per_max_strain.append(self.fem.compute_max_surface_strain(u, p_actual, field_results=f_res))
-                per_sed.append(self.fem.compute_strain_energy_density(u, p_actual, field_results=f_res))
+                
+                eps = 1e-3
+                
+                # Displacement loss
+                scale_disp = jnp.mean(jnp.abs(self.targets_low[i]['u_static'])) + eps
+                delta_disp = w - self.targets_low[i]['u_static']
+                l_static += jnp.mean((delta_disp / scale_disp)**2) * self.targets_low[i]['weight']
+                
+                if use_surface_stress:
+                    scale_stress = jnp.mean(jnp.abs(self.targets_low[i]['max_stress'])) + eps
+                    delta_stress = self.fem.compute_max_surface_stress(u, p_actual, field_results=f_res) - self.targets_low[i]['max_stress']
+                    l_stress += jnp.mean((delta_stress / scale_stress)**2)
+                if use_surface_strain:
+                    scale_strain = jnp.mean(jnp.abs(self.targets_low[i]['max_strain'])) + eps
+                    delta_strain = self.fem.compute_max_surface_strain(u, p_actual, field_results=f_res) - self.targets_low[i]['max_strain']
+                    l_strain += jnp.mean((delta_strain / scale_strain)**2)
+                if use_strain_energy:
+                    scale_energy = jnp.mean(jnp.abs(self.targets_low[i]['strain_energy_density'])) + eps
+                    delta_energy = self.fem.compute_strain_energy_density(u, p_actual, field_results=f_res) - self.targets_low[i]['strain_energy_density']
+                    l_energy += jnp.mean((delta_energy / scale_energy)**2)
+                
+                # Reaction loss
                 R_opt = K @ u - b['F']
                 opt_R_sums = jnp.array([
                     jnp.sum(jnp.abs(R_opt[0::6])),
@@ -703,206 +534,9 @@ class EquivalentSheetModel:
                     jnp.sum(jnp.abs(R_opt[4::6])),
                     jnp.sum(jnp.abs(R_opt[5::6]))
                 ])
-                per_reaction_sums.append(opt_R_sums)
-
-            # Now evaluate all OptTarget descriptors (per-case and global) into a single opt_loss
-            l_static, l_stress, l_strain, l_energy, l_reaction = 0.0, 0.0, 0.0, 0.0, 0.0
-            opt_loss = 0.0
-            for desc in targets_jax:
-                typ = desc['type']
-                wgt = desc.get('weight', 1.0)
-                ci = desc.get('case_idx')
-                # helper to fetch per-case arrays
-                def get_case_arr(key, idx):
-                    if key == 'u_static':
-                        return per_u[idx]
-                    if key == 'w':
-                        return per_w[idx]
-                    if key == 'max_stress':
-                        return per_max_stress[idx]
-                    if key == 'max_strain':
-                        return per_max_strain[idx]
-                    if key == 'strain_energy_density':
-                        return per_sed[idx]
-                    if key == 'reaction_sums':
-                        return per_reaction_sums[idx]
-                    return per_w[idx]
-
-                if ci is not None:
-                    # per-case target
-                    idx = int(ci)
-                    if typ == 'field_stat':
-                        ref_key = desc.get('ref_key', 'u_static')
-                        data = get_case_arr(ref_key, idx)
-                        red = desc.get('reduction', 'max')
-                        if red == 'max':
-                            val = jnp.nanmax(data)
-                        elif red == 'mean':
-                            val = jnp.nanmean(data)
-                        elif red == 'rms':
-                            val = jnp.sqrt(jnp.nanmean(data**2))
-                        else:
-                            val = jnp.nanmax(data)
-                        # obtain reference (pre-interpolated)
-                        ref_arr = self.targets_low[idx].get(ref_key)
-                        if ref_arr is None:
-                            ref_val = 0.0
-                        else:
-                            if hasattr(ref_arr, 'ndim') and ref_arr.ndim > 0:
-                                if red == 'max':
-                                    ref_val = jnp.max(ref_arr)
-                                else:
-                                    ref_val = jnp.mean(ref_arr)
-                            else:
-                                ref_val = ref_arr
-                        if desc.get('compare_mode','absolute') == 'relative' and ref_val != 0:
-                            terr = (val - ref_val) / (ref_val + 1e-12)
-                        else:
-                            terr = val - ref_val
-                        if typ == 'rbe_reaction': l_reaction += wgt * (terr**2)
-                        elif typ == 'field_stat':
-                            if desc.get('ref_key') == 'u_static': l_static += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'max_stress': l_stress += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'max_strain': l_strain += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'strain_energy_density': l_energy += wgt * (terr**2)
-                            else: l_static += wgt * (terr**2)
-                        elif typ == 'mass': pass # mass is handled later
-                        elif typ == 'modes': pass # modes handled later
-
-                    elif typ == 'rbe_reaction':
-                        comp = desc.get('component', None)
-                        val_vec = get_case_arr('reaction_sums', idx)
-                        ref_vec = self.targets_low[idx].get('reaction_sums')
-                        ref_mean = jnp.mean(ref_vec) + 1e-12
-                        terr = (jnp.mean(val_vec) - jnp.mean(ref_vec)) / ref_mean
-                        if typ == 'rbe_reaction': l_reaction += wgt * (terr**2)
-                        elif typ == 'field_stat':
-                            if desc.get('ref_key') == 'u_static': l_static += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'max_stress': l_stress += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'max_strain': l_strain += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'strain_energy_density': l_energy += wgt * (terr**2)
-                            else: l_static += wgt * (terr**2)
-                        elif typ == 'mass': pass # mass is handled later
-                        elif typ == 'modes': pass # modes handled later
-
-                    elif typ == 'modes':
-                        # already handled in global eigen pass; skip per-case here
-                        pass
-
-                    elif typ == 'mass':
-                        if 't' in p_fem and 'rho' in p_fem:
-                            mass_opt = jnp.sum(p_fem['t'] * p_fem['rho']) * (self.fem.Lx / Nx_l) * (self.fem.Ly / Ny_l)
-                        else:
-                            mass_opt = 0.0
-                        ref_mass = float(desc.get('ref_value', self.target_mass))
-                        if desc.get('compare_mode','absolute') == 'relative' and ref_mass != 0:
-                            terr = (mass_opt - ref_mass) / (ref_mass + 1e-12)
-                        else:
-                            terr = mass_opt - ref_mass
-                        if typ == 'rbe_reaction': l_reaction += wgt * (terr**2)
-                        elif typ == 'field_stat':
-                            if desc.get('ref_key') == 'u_static': l_static += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'max_stress': l_stress += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'max_strain': l_strain += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'strain_energy_density': l_energy += wgt * (terr**2)
-                            else: l_static += wgt * (terr**2)
-                        elif typ == 'mass': pass # mass is handled later
-                        elif typ == 'modes': pass # modes handled later
-
-                else:
-                    # global descriptor
-                    if typ == 'mass':
-                        if 't' in p_fem and 'rho' in p_fem:
-                            mass_opt = jnp.sum(p_fem['t'] * p_fem['rho']) * (self.fem.Lx / Nx_l) * (self.fem.Ly / Ny_l)
-                        else:
-                            mass_opt = 0.0
-                        ref_mass = float(desc.get('ref_value', self.target_mass))
-                        if desc.get('compare_mode','absolute') == 'relative' and ref_mass != 0:
-                            terr = (mass_opt - ref_mass) / (ref_mass + 1e-12)
-                        else:
-                            terr = mass_opt - ref_mass
-                        if typ == 'rbe_reaction': l_reaction += wgt * (terr**2)
-                        elif typ == 'field_stat':
-                            if desc.get('ref_key') == 'u_static': l_static += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'max_stress': l_stress += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'max_strain': l_strain += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'strain_energy_density': l_energy += wgt * (terr**2)
-                            else: l_static += wgt * (terr**2)
-                        elif typ == 'mass': pass # mass is handled later
-                        elif typ == 'modes': pass # modes handled later
-
-                    elif typ == 'modes':
-                        # evaluate using freqs/vecs if available
-                        fw = float(desc.get('freq_weight', 0.0))
-                        nmode = int(desc.get('num_modes') or len(t_vals))
-                        if freqs is not None and vecs is not None:
-                            cand_modes = vecs[2::6, :]
-                            dots = jnp.dot(t_modes_l.T, cand_modes)
-                            norm_t = jnp.sum(t_modes_l**2, axis=0, keepdims=True)
-                            norm_c = jnp.sum(cand_modes**2, axis=0, keepdims=True)
-                            mac_matrix = (dots**2) / (norm_t.T @ norm_c + 1e-10)
-                            best_mac_per_target = jnp.max(mac_matrix, axis=1)
-                            mac_err = jnp.mean((1.0 - best_mac_per_target[:nmode])**2) if nmode > 0 else 0.0
-                            if fw > 0.0 and freqs is not None:
-                                n_f = min(nmode, freqs.shape[0], t_vals.shape[0])
-                                if n_f > 0:
-                                    ref_f = t_vals[:n_f]
-                                    opt_f = freqs[:n_f]
-                                    freq_err = jnp.mean(jnp.abs((opt_f - ref_f) / (ref_f + 1e-12)))
-                                else:
-                                    freq_err = 0.0
-                                combined = mac_err * (1.0 - fw) + freq_err * fw
-                            else:
-                                combined = mac_err
-                            opt_loss += wgt * combined
-
-                    elif typ == 'field_stat':
-                        # compare aggregated field stat across all cases
-                        ref_key = desc.get('ref_key', 'u_static')
-                        stacked = jnp.stack([t[ref_key] for t in self.targets_low], axis=0)
-                        if desc.get('reduction','max') == 'max':
-                            ref_val = jnp.max(stacked)
-                        else:
-                            ref_val = jnp.mean(stacked)
-                        cur_val = jnp.max(stacked) if desc.get('reduction','max') == 'max' else jnp.mean(stacked)
-                        if desc.get('compare_mode','absolute') == 'relative' and ref_val != 0:
-                            terr = (cur_val - ref_val) / (ref_val + 1e-12)
-                        else:
-                            terr = cur_val - ref_val
-                        if typ == 'rbe_reaction': l_reaction += wgt * (terr**2)
-                        elif typ == 'field_stat':
-                            if desc.get('ref_key') == 'u_static': l_static += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'max_stress': l_stress += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'max_strain': l_strain += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'strain_energy_density': l_energy += wgt * (terr**2)
-                            else: l_static += wgt * (terr**2)
-                        elif typ == 'mass': pass # mass is handled later
-                        elif typ == 'modes': pass # modes handled later
-
-                    elif typ == 'rbe_reaction':
-                        # global compare: mean reaction sums across cases
-                        ref_vec = jnp.mean(jnp.stack([t['reaction_sums'] for t in self.targets_low], axis=0), axis=0)
-                        # use mean of computed per_reaction_sums
-                        opt_vec = jnp.mean(jnp.stack(per_reaction_sums, axis=0), axis=0)
-                        ref_mean = jnp.mean(ref_vec) + 1e-12
-                        terr = (jnp.mean(opt_vec) - jnp.mean(ref_vec)) / ref_mean
-                        if typ == 'rbe_reaction': l_reaction += wgt * (terr**2)
-                        elif typ == 'field_stat':
-                            if desc.get('ref_key') == 'u_static': l_static += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'max_stress': l_stress += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'max_strain': l_strain += wgt * (terr**2)
-                            elif desc.get('ref_key') == 'strain_energy_density': l_energy += wgt * (terr**2)
-                            else: l_static += wgt * (terr**2)
-                        elif typ == 'mass': pass # mass is handled later
-                        elif typ == 'modes': pass # modes handled later
-
-            # Regularization (kept)
-            l_reg = 0.0
-            for k in ['t', 'pz']:
-                if k in p_scaled:
-                    val = p_scaled[k]
-                    if val.ndim > 1:
-                        l_reg += (jnp.mean(jnp.diff(val, axis=0)**2) + jnp.mean(jnp.diff(val, axis=1)**2))
+                tgt_R_sums = self.targets_low[i]['reaction_sums']
+                scale_R = jnp.mean(tgt_R_sums) + eps
+                l_reaction += jnp.mean(((opt_R_sums - tgt_R_sums) / scale_R)**2)
 
             n_cases = len(self.cases)
             l_static /= n_cases; l_stress /= n_cases; l_strain /= n_cases; l_energy /= n_cases; l_reaction /= n_cases
@@ -912,10 +546,11 @@ class EquivalentSheetModel:
             # --- [SPEED OPTIMIZATION] ---
             # If we don't care about frequency matching or mode shape matching, 
             # bypass the expensive O(N^3) dense eigen solver entirely!
-            # --- [SPEED OPTIMIZATION - ARPACK SPARSE EIGENVALUE] ---
-            if freqs is not None and vecs is not None:
-                # 🚀 Use ARPACK for 300x speedup: Sparse matrix retained, only k modes computed
+            # --- [SPEED OPTIMIZATION] ---
+            if loss_weights.get('freq', 0.0) > 1e-6 or loss_weights.get('mode', 0.0) > 1e-6:
+                # fem.solve_eigen now already filters and identifies elastic modes!
                 n_tgt = len(t_vals)
+                freqs, vecs = self.fem.solve_eigen(K, M, num_modes=n_tgt, num_skip=6)
                 
                 # 1. Frequency Matching (Relative Error on Eigenvalues λ = ω^2)
                 # Since frequencies are already in Hz: (f_opt / f_tgt - 1)^2
@@ -933,131 +568,27 @@ class EquivalentSheetModel:
                 
                 best_mac_per_target = jnp.max(mac_matrix, axis=1) # Perfect match = 1.0
                 
-                # Build combined mode loss from descriptors (if any)
-                mode_descs = [d for d in targets_jax if d['type'] == 'modes']
-                if len(mode_descs) == 0:
-                    # default behaviour: MAC-only
-                    if mode_match_type == 'mac':
-                        l_mode = jnp.mean((1.0 - best_mac_per_target)**2)
-                    else:
-                        best_match_idx = jnp.argmax(mac_matrix, axis=1)
-                        best_cand_modes = cand_modes[:, best_match_idx]
-                        best_dots = jnp.diagonal(jnp.dot(t_modes_l.T, best_cand_modes))
-                        signs = jnp.where(best_dots < 0, -1.0, 1.0)
-                        aligned_modes = best_cand_modes * signs
-                        target_normed = t_modes_l / jnp.sqrt(norm_t.reshape(1, -1) + 1e-10)
-                        cand_normed = aligned_modes / jnp.sqrt(jnp.sum(aligned_modes**2, axis=0, keepdims=True) + 1e-10)
-                        l_shape_mse = jnp.mean((target_normed - cand_normed)**2)
-                        if mode_match_type == 'direct':
-                            l_mode = l_shape_mse * 100.0
-                        else:
-                            l_mode = jnp.mean((1.0 - best_mac_per_target)**2) + (l_shape_mse * 50.0)
-                else:
-                    # accumulate weighted descriptors (normalize by total descriptor weight)
-                    total_w = jnp.sum(jnp.array([d.get('weight', 1.0) for d in mode_descs]))
-                    acc = 0.0
-                    for d in mode_descs:
-                        wgt_d = d.get('weight', 1.0)
-                        # mac error per target modes
-                        n_use = d.get('num_modes') or n_tgt
-                        n_use = min(n_use, best_mac_per_target.shape[0])
-                        mac_err = jnp.mean((1.0 - best_mac_per_target[:n_use])**2) if n_use > 0 else 0.0
-                        fw = float(d.get('freq_weight', 0.0))
-                        if fw > 0.0:
-                            n_f = min(n_use, freqs.shape[0], t_vals.shape[0])
-                            if n_f > 0:
-                                ref_f = t_vals[:n_f]
-                                opt_f = freqs[:n_f]
-                                freq_err = jnp.mean(jnp.abs((opt_f - ref_f) / (ref_f + 1e-12)))
-                            else:
-                                freq_err = 0.0
-                            combined = mac_err * (1.0 - fw) + freq_err * fw
-                        else:
-                            combined = mac_err
-                        acc += wgt_d * combined
-                    l_mode = acc / jnp.maximum(1.0, total_w)
-
+                if mode_match_type == 'mac':
+                    l_mode = jnp.mean((1.0 - best_mac_per_target)**2)
+                else: 
+                    # Hybrid/Direct matching for shape consistency
+                    best_match_idx = jnp.argmax(mac_matrix, axis=1)
+                    best_cand_modes = cand_modes[:, best_match_idx]
+                    
+                    best_dots = jnp.diagonal(jnp.dot(t_modes_l.T, best_cand_modes))
+                    signs = jnp.where(best_dots < 0, -1.0, 1.0)
+                    aligned_modes = best_cand_modes * signs
+                    
+                    target_normed = t_modes_l / jnp.sqrt(norm_t.reshape(1, -1) + 1e-10)
+                    cand_normed = aligned_modes / jnp.sqrt(jnp.sum(aligned_modes**2, axis=0, keepdims=True) + 1e-10)
+                    l_shape_mse = jnp.mean((target_normed - cand_normed)**2)
+                    
+                    if mode_match_type == 'direct':
+                        l_mode = l_shape_mse * 100.0
+                    else: # 'hybrid'
+                        l_mode = jnp.mean((1.0 - best_mac_per_target)**2) + (l_shape_mse * 50.0)
+                
                 f1_hz = freqs[0]
-
-            # --- Global descriptors (case_idx == None) ---
-            for gdesc in [d for d in targets_jax if d.get('case_idx') is None]:
-                gtyp = gdesc['type']
-                gw = gdesc.get('weight', 1.0)
-                if gtyp == 'mass':
-                    # current mass already computed above when use_mass_constraint handled
-                    if 't' in p_fem and 'rho' in p_fem:
-                        mass_opt = jnp.sum(p_fem['t'] * p_fem['rho']) * (self.fem.Lx / Nx_l) * (self.fem.Ly / Ny_l)
-                    else:
-                        mass_opt = 0.0
-                    ref_mass = float(gdesc.get('ref_value', self.target_mass))
-                    if gdesc.get('compare_mode','absolute') == 'relative' and ref_mass != 0:
-                        terr = (mass_opt - ref_mass) / (ref_mass + 1e-12)
-                    else:
-                        terr = mass_opt - ref_mass
-                    l_mass += gw * (terr**2)
-
-                elif gtyp == 'modes':
-                    # evaluate using already computed freqs/vecs if available
-                    fw = float(gdesc.get('freq_weight', 0.0))
-                    nmode = int(gdesc.get('num_modes') or n_tgt)
-                    cand_modes = vecs[2::6, :] if vecs is not None else None
-                    if cand_modes is not None:
-                        dots = jnp.dot(t_modes_l.T, cand_modes)
-                        norm_t = jnp.sum(t_modes_l**2, axis=0, keepdims=True)
-                        norm_c = jnp.sum(cand_modes**2, axis=0, keepdims=True)
-                        mac_matrix = (dots**2) / (norm_t.T @ norm_c + 1e-10)
-                        best_mac_per_target = jnp.max(mac_matrix, axis=1)
-                        mac_err = jnp.mean((1.0 - best_mac_per_target[:nmode])**2) if nmode > 0 else 0.0
-                        if fw > 0.0 and freqs is not None:
-                            n_f = min(nmode, freqs.shape[0], t_vals.shape[0])
-                            if n_f > 0:
-                                ref_f = t_vals[:n_f]
-                                opt_f = freqs[:n_f]
-                                freq_err = jnp.mean(jnp.abs((opt_f - ref_f) / (ref_f + 1e-12)))
-                            else:
-                                freq_err = 0.0
-                            combined = mac_err * (1.0 - fw) + freq_err * fw
-                        else:
-                            combined = mac_err
-                        l_mode += gw * combined
-
-                elif gtyp == 'field_stat':
-                    # global field stat - compare aggregated over all cases' target arrays
-                    ref_key = gdesc.get('ref_key', 'u_static')
-                    # use average over targets_low arrays
-                    if ref_key in self.targets_low[0]:
-                        ref_arrs = jnp.stack([t[ref_key] for t in self.targets_low], axis=0)
-                        if gdesc.get('reduction','max') == 'max':
-                            ref_val = jnp.max(ref_arrs)
-                        else:
-                            ref_val = jnp.mean(ref_arrs)
-                    else:
-                        ref_val = 0.0
-                    # compute current value as average over cases
-                    # for simplicity compare mean of current computed field across cases
-                    cur_vals = []
-                    for i in range(len(self.cases)):
-                        # we only have f_res computed per-case earlier; reuse stored targets_low as proxy
-                        cur_vals.append(self.targets_low[i].get(ref_key, 0.0))
-                    cur_stack = jnp.stack(cur_vals, axis=0)
-                    if gdesc.get('reduction','max') == 'max':
-                        cur_val = jnp.max(cur_stack)
-                    else:
-                        cur_val = jnp.mean(cur_stack)
-                    if gdesc.get('compare_mode','absolute') == 'relative' and ref_val != 0:
-                        terr = (cur_val - ref_val) / (ref_val + 1e-12)
-                    else:
-                        terr = cur_val - ref_val
-                    l_static += gw * (terr**2)
-
-                elif gtyp == 'rbe_reaction':
-                    # compare total reaction sums across cases (global aggregate)
-                    # use mean of target reaction_sums as ref
-                    ref_vec = jnp.mean(jnp.stack([t['reaction_sums'] for t in self.targets_low], axis=0), axis=0)
-                    opt_vec = jnp.mean(jnp.stack([K @ self.fem.solve_static_partitioned(K, b['F'], b['free'], b['fd'], b['fv'])[2::6] for b in case_bcs], axis=0), axis=0)
-                    ref_mean = jnp.mean(ref_vec) + 1e-12
-                    terr = (jnp.mean(opt_vec) - jnp.mean(ref_vec)) / ref_mean
-                    l_reaction += gw * (terr**2)
             
             # --- [FIXED] 질량 제약(Mass Constraint)에 mass_tolerance 적용 ---
             # 질량이 허용 한도(tolerance)를 넘어서면 폭발적인 페널티(Quadratic Penalty)를 부여합니다.
@@ -1090,18 +621,12 @@ class EquivalentSheetModel:
                           l_mass   * loss_weights.get('mass', 0.0) +
                           l_reg    * loss_weights.get('reg', 0.0))
                           
-            # [FIXED] Robust diagonal extraction for both Dense and Sparse (BCOO) matrices
-            # [DIAGNOSTICS] Simplified metrics to avoid JIT-incompatible sparse diag operations
-            # Mass is already calculated for l_mass constraint
-            current_mass = jnp.sum(p_actual['t'] * p_actual['rho']) * (self.fem.Lx/Nx_l)*(self.fem.Ly/Ny_l)
-
             return total_loss, {
                 'Total': total_loss, 'Disp': l_static, 'Strs': l_stress, 'Strn': l_strain, 
                 'Engy': l_energy, 'Reac': l_reaction, 'Freq': l_freq, 'Mode': l_mode, 
                 'Gt_Z': l_gt_z, 'Mass': l_mass, 'Reg': l_reg, 'f1_hz': f1_hz,
-                'total_m_ton': current_mass,
-                'avg_k_diag': jnp.mean(p_actual['E']), # Proxy for stiffness diagnostic
-                'K': K, 'M': M
+                'total_m_ton': jnp.sum(jnp.diag(M)[2::6]),
+                'avg_k_diag': jnp.mean(jnp.diag(K))
             }
 
         # --- [ISSUE-015] PRE-OPTIMIZATION DIAGNOSTICS & AUTO-SCALING ---
@@ -1110,7 +635,7 @@ class EquivalentSheetModel:
         
         # 1. Initial Raw Loss Pass (for auto-scaling)
         # We call loss_fn without JIT to get concrete values for diagnostics
-        init_val, init_metrics = loss_fn(params, fixed_params_scaled, None, None, loss_weights)
+        init_val, init_metrics = loss_fn(params, fixed_params_scaled)
         
         # [DIAGNOSTICS] Physical Unit Verification
         diagnostic_m = float(init_metrics.get('total_m_ton', 0.0))
@@ -1150,9 +675,7 @@ class EquivalentSheetModel:
             init_val, init_metrics = loss_fn(params, fixed_params_scaled)
 
         # 2. Compile Jitted Version for Optimization
-        # NOTE: loss_fn cannot be fully JIT-compiled due to solve_eigen's JAX incompatibilities.
-        # Instead, we'll call loss_fn directly without full JIT, and optimize internally-JIT'd operations.
-        loss_vg_direct = jax.value_and_grad(loss_fn, has_aux=True)
+        loss_vg = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))
 
         print(f" -> Target Mass  : {self.target_mass:.4f} Ton")
         print(f" -> Initial Freq1: {float(init_metrics['f1_hz']):6.2f} Hz")
@@ -1161,17 +684,7 @@ class EquivalentSheetModel:
         print("\n [Effective Weights]")
         for k, v in loss_weights.items():
             if v > 0: print(f"    - {k:<15}: {v:.4e}")
-        
-        # [PERFORMANCE OPTIMIZATION] Store original eigen-related weights for cyclic control
-        orig_freq_weight = loss_weights.get('freq', 0.0)
-        orig_mode_weight = loss_weights.get('mode', 0.0)
-        
-        # Initialize cached eigen values (computed periodically)
-        cached_freqs = None
-        cached_vecs = None
-        cached_f1_hz = None  # Keep last computed frequency for display
-        print(f"\n [PERFORMANCE] Eigen Decomposition Frequency: Every {eigen_freq} iterations")
-        print(f"    (Expensive eigenvalue solve: computed every {eigen_freq} iters, cached otherwise)")
+            
         print("-"*80 + "\n")
 
         # --- Initialize tracking variables BEFORE the loop ---
@@ -1190,40 +703,7 @@ class EquivalentSheetModel:
         print("-" * 70)
 
         for i in range(max_iterations):
-            # [PERFORMANCE OPTIMIZATION - PERIODIC EIGEN COMPUTATION]
-            # Only compute expensive eigenvalue decomposition every eigen_freq iterations
-            # This reduces O(N^3) calls by ~95% while maintaining converged solution quality
-            compute_eigen_now = (i % eigen_freq == 0)
-            
-            # Temporarily enable/disable freq/mode losses based on computation schedule
-            if not compute_eigen_now:
-                loss_weights['freq'] = 0.0
-                loss_weights['mode'] = 0.0
-            else:
-                loss_weights['freq'] = orig_freq_weight
-                loss_weights['mode'] = orig_mode_weight
-            
-            # Compute eigen if needed
-            freqs = None
-            vecs = None
-            if compute_eigen_now:
-                # Get K and M by calling loss_fn without eigen
-                val_temp, metrics_temp = loss_fn(params, fixed_params_scaled, None, None, loss_weights)
-                K = metrics_temp['K']
-                M = metrics_temp['M']
-                # Use Hybrid ARPACK on Sparse Matrices (No Dense Conversion)
-                freqs_np, vecs_np = self.fem.solve_eigen_arpack_jax_compatible(K, M, num_modes=len(t_vals), num_skip=6)
-                freqs = jnp.array(freqs_np)
-                vecs = jnp.array(vecs_np)
-            
-            (val, metrics), grads = jax.value_and_grad(lambda p, fp: loss_fn(p, fp, freqs, vecs, loss_weights), has_aux=True)(params, fixed_params_scaled)
-            
-            # [PERFORMANCE] Update cached frequency for display
-            # When freq loss is OFF (compute_eigen_now=False), use previously computed value
-            if compute_eigen_now:
-                cached_f1_hz = metrics.get('f1_hz', cached_f1_hz)  # Update cache
-            elif cached_f1_hz is not None:
-                metrics['f1_hz'] = cached_f1_hz  # Restore last computed value for display
+            (val, metrics), grads = loss_vg(params, fixed_params_scaled)
             
             # [FIXED LOGIC] Store BEST params BEFORE they are updated by the optimizer
             if val < best_loss - early_stop_tol:
@@ -1234,7 +714,7 @@ class EquivalentSheetModel:
                 wait += 1
 
             # Store history (on CPU as regular floats)
-            self.history.append({k: float(v) for k, v in metrics.items() if k not in ['K', 'M']})
+            self.history.append({k: float(v) for k, v in metrics.items()})
             
             updates, opt_state = optimizer.update(jax.tree_util.tree_map(lambda g: jnp.where(jnp.isfinite(g), g, 0.0), grads), opt_state)
             params = optax.apply_updates(params, updates)
@@ -1287,14 +767,7 @@ class EquivalentSheetModel:
         # Final Assignment
         params = best_params
         self.optimized_params = {**{k: v * self.scaling[k] for k, v in params.items()}, **{k: v * self.scaling[k] for k, v in fixed_params_scaled.items()}}
-        
-        # [PERFORMANCE] Restore full weights and use last computed eigen values for final evaluation
-        loss_weights['freq'] = orig_freq_weight
-        loss_weights['mode'] = orig_mode_weight
-        final_val, final_metrics = loss_fn(params, fixed_params_scaled, cached_freqs, cached_vecs, loss_weights)
-        
         print(f"\n -> Optimization Finished. Best Result found at Iteration {best_iter} with Loss: {best_loss:.6f}")
-        print(f" -> [FINAL EVAL] Full Loss (With Freq/Mode): {final_val:.6f}")
         
         # Generate convergence plot automatically
         self.plot_optimization_history()
@@ -1508,8 +981,8 @@ class EquivalentSheetModel:
             M_y_tgt = np.sum(np.abs(R_full_tgt[4::6]))
             max_mom_tgt = np.sqrt(M_x_tgt**2 + M_y_tgt**2)
 
-            # Calculate for Optimized (JAX Sparse Matmul)
-            R_full_opt = np.array(K_opt @ jnp.array(u_opt)) - np.array(F)
+            # Calculate for Optimized (Sparse Dot)
+            R_full_opt = K_opt.dot(np.array(u_opt)) - np.array(F)
             max_force_z_opt = np.max(np.abs(R_full_opt[2::6]))
             M_x_opt = np.sum(np.abs(R_full_opt[3::6]))
             M_y_opt = np.sum(np.abs(R_full_opt[4::6]))
@@ -1537,8 +1010,6 @@ class EquivalentSheetModel:
 
             # Disp
             levels_w = np.linspace(np.min(w_ref), np.max(w_ref), 30)
-            min_w, max_w = float(np.min(w_ref)), float(np.max(w_ref))
-            levels_w = np.linspace(min_w, max_w if max_w > min_w + 1e-12 else min_w + 1e-12, 30)
             plot_field(axes[0,0], w_ref, "Target Disp (mm)", levels=levels_w, cmap='jet')
             plot_field(axes[0,1], w_opt, "Optimized Disp (mm)", levels=levels_w, cmap='jet')
             plot_field(axes[0,2], np.abs(w_opt - w_ref), "Error (mm)", cmap='YlOrRd')
@@ -1736,32 +1207,19 @@ class EquivalentSheetModel:
             u_opt = self.fem_high.solve_static_sparse(K_opt, F_ext, free, fd, fv)
             u_ref = tgt['u_full']
             
-            # Compute Detailed Field Results for Optimized model
-            f_res_opt = self.fem_high.compute_field_results(u_opt, self.optimized_params)
-            
-            # Export Optimized Static Result to ParaView
-            res_fields_opt = {
-                'displacement_vec': np.array(u_opt),
-                'stress_vm': np.array(f_res_opt['stress_vm']),
-                'strain_x': np.array(f_res_opt['strain_x']),
-                'sed': np.array(f_res_opt['sed'])
-            }
-            res_opt = StructuralResult(res_fields_opt, np.array(self.fem_high.nodes), self.fem_high.elements)
-            res_opt.save_vtkhdf(f"opt_static_{case.name}.vtkhdf")
-            
             # 1. Displacement
             w_ref, w_opt = tgt['u_static'], u_opt[2::6]
             max_w_ref, max_w_opt = np.max(np.abs(w_ref)), np.max(np.abs(w_opt))
             
-            # 2. Reaction Forces (at fixed DOFs) - JAX Sparse Matmul
-            R_vec_ref = (np.array(K_opt @ jnp.array(u_ref)) - np.array(F_ext))[2::6] # Simplified Z-component reactions
-            R_vec_opt = (np.array(K_opt @ jnp.array(u_opt)) - np.array(F_ext))[2::6]
+            # 2. Reaction Forces (at fixed DOFs) - Sparse Dot
+            R_vec_ref = (K_opt.dot(np.array(u_ref)) - np.array(F_ext))[2::6] # Simplified Z-component reactions
+            R_vec_opt = (K_opt.dot(np.array(u_opt)) - np.array(F_ext))[2::6]
             max_R_ref, max_R_opt = np.max(np.abs(tgt['reaction_full'][2::6])), np.max(np.abs(R_vec_opt))
             
             # 3. Bending Moments (Approximated from reaction force moments)
             # compute_moment is not available in ShellFEM; use reaction Mx/My as proxy
             R_full_ref = np.array(tgt['reaction_full'])
-            R_full_opt = np.array(K_opt @ jnp.array(u_opt)) - np.array(F_ext)
+            R_full_opt = K_opt.dot(np.array(u_opt)) - np.array(F_ext)
             max_M_ref = np.sqrt(np.sum(R_full_ref[3::6]**2) + np.sum(R_full_ref[4::6]**2))
             max_M_opt = np.sqrt(np.sum(R_full_opt[3::6]**2) + np.sum(R_full_opt[4::6]**2))
             
@@ -1852,17 +1310,6 @@ class EquivalentSheetModel:
             'modes': vecs_l[2::6, :n_modes]   # Extract w-displacement
         }
 
-        # --- NEW: Export Optimized Modal Results to Temporal VTKHDF ---
-        print("\nExporting Optimized Modal Analysis to ParaView...")
-        modal_res_opt = StructuralResult({}, np.array(self.fem.nodes), self.fem.elements)
-        steps_dict_opt = {
-            'values': freq_l,
-            'point_data': {
-                'mode_shape_vec': [vecs_l[:, i] for i in range(n_modes)]
-            }
-        }
-        modal_res_opt.save_vtkhdf("opt_modal_results.vtkhdf", steps_dict=steps_dict_opt)
-
         stage3_visualize_comparison(
             self.fem_high, self.fem, self.targets, self.optimized_params, self.target_params_high,
             opt_eigen=opt_eigen_l, tgt_eigen=self.target_eigen
@@ -1872,15 +1319,8 @@ class EquivalentSheetModel:
 # MAIN EXECUTION: COMPREHENSIVE CONFIGURATION TEMPLATE
 # ==============================================================================
 if __name__ == '__main__':
-    if os.environ.get('RUN_FULL_OPT', '0').lower() not in ('1', 'true', 'yes'):
-        print("RUN_FULL_OPT environment variable must be set to '1' to execute the main optimization pipeline.")
-        print("Example: set RUN_FULL_OPT=1 && python main_shell_verification.py")
-        sys.exit(0)
-
     # XLA Flags (Optimized for CPU)
-    os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=1 --xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=4"
-    os.environ["OMP_NUM_THREADS"] = "4"
-    os.environ["MKL_NUM_THREADS"] = "4"
+    os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=1 --xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=6"
 
     model = EquivalentSheetModel(Lx, Ly, Nx_low, Ny_low)
     
@@ -1892,19 +1332,6 @@ if __name__ == '__main__':
     model.add_case(CornerLiftCase("lift_br", corner='br', value=5.0, mode='disp', weight=1.0))
     model.add_case(CornerLiftCase("lift_tl", corner='tl', value=5.0, mode='disp', weight=1.0))
     model.add_case(TwoCornerLiftCase("lift_tl_br", corners=['br', 'tl'], value=5.0, mode='disp', weight=1.0))
-    model.add_case(CantileverCase("cantilever_x", axis='x', value=-5.0, mode='disp', weight=1.0))
-    model.add_case(CantileverCase("cantilever_y", axis='y', value=-5.0, mode='disp', weight=1.0))
-    model.add_case(PressureCase("pressure_z", value=-10.0, weight=1.0))
-    
-    # Apply opt-targets configuration (Python dict with detailed comments)
-    # OptTarget.preset()를 사용하여 기본 최적화 목표 설정을 가져옵니다.
-    opt_target_config = OptTarget.preset()
-    
-    try:
-        apply_case_targets_from_spec(model, opt_target_config)
-        print("[INFO] Applied inline opt-target configuration with detailed comments.")
-    except Exception as e:
-        print(f"[INFO] No inline targets applied ({e}).")
     
     # 3. Ground Truth Generation (target_config)
     target_config = {
@@ -1919,10 +1346,10 @@ if __name__ == '__main__':
     # 4. Optimization Search Space (opt_config)
     opt_config = {
         # 'type': 'global'을 추가하면 전체 평판의 두께가 동일한 값으로 최적화됩니다.
-        't':   {'opt': True, 'init': 1.0, 'min': 0.8, 'max': 1.2, 'type': 'global'},        
+        't':   {'opt': False, 'init': 1.0, 'min': 0.8, 'max': 1.2, 'type': 'global'},        
         # 'nodal' (또는 생략)은 기존처럼 위치마다 다른 값을 갖는 위상 최적화 모드입니다.
-        'rho': {'opt': True, 'init': 7.85e-9, 'min': 1e-10, 'max': 1e-7, 'type': 'global'},
-        'E':   {'opt': True, 'init': 210000.0, 'type': 'global'},        
+        'rho': {'opt': False, 'init': 7.85e-9, 'min': 1e-10, 'max': 1e-7, 'type': 'global'},
+        'E':   {'opt': False, 'init': 210000.0, 'type': 'global'},        
         # pz(형상)도 global로 설정하면 평판이 구부러지는 게 아니라 전체가 위아래로만 움직입니다.
         'pz':  {'opt': True, 'init': 0.0, 'min': -20.0, 'max': 20.0, 'type': 'local'}, 
     }
@@ -1965,53 +1392,53 @@ if __name__ == '__main__':
                                         use_surface_strain=False,    
                                         use_mass_constraint=True,    
                                         mass_tolerance=0.05,         
-                                        max_iterations=100,          # [조정] 초기 단계 기초 형상 확보
+                                        max_iterations=80,          
                                         use_early_stopping=True, 
-                                        early_stop_patience=40, 
+                                        early_stop_patience=500, 
                                         early_stop_tol=1e-8,
-                                        learning_rate=0.5,           
-                                        num_modes_loss=3,            
-                                        min_bead_width=150.0,        # [표준화] 제조 한계 150mm 적용
-                                        mac_search_window=3,         
-                                        mode_match_type='mac',    
+                                        learning_rate=0.2,           
+                                        num_modes_loss=5,
+                                        min_bead_width=120.0,        # [조정] 메시 해상도에 적합한 비드 크기 유도
+                                        mac_search_window=5,         # 모드 순서가 뒤집혀도 찾을 수 있도록 여유로운 비교 범위 부여
+                                        mode_match_type='mac',    # 'mac', 'direct', 'hybrid' (제안된 형상 직접 매칭 방식)
                                         init_pz_from_gt=True,        # [NEW 옵션] 타겟 Ground Truth 좌표를 기반으로 초기 형태 전사 (사용)
                                         gt_init_scale=0.5,           # 상향 조정 (0.3 -> 0.5)
-                                        auto_scale=False)
+                                        auto_scale=True)
                                         
         # --- STAGE 2: MAC FINE-TUNING ---
-        print("\n\n" + "#"*70)
-        print(" [RUN STAGE 2] MAC 미세 조정 런 (High MAC Weight & hybrid Matching)")
-        print("#"*70)
+        #print("\n\n" + "#"*70)
+        #print(" [RUN STAGE 2] MAC 미세 조정 런 (High MAC Weight & Wider Search)")
+        #print("#"*70)
         
         # Stage 1 결과를 초기값으로 세팅
-        opt_config_stage2 = {
-            't':   {'opt': opt_config['t']['opt'], 'init': best_params_s1['t'], 'min': opt_config['t']['min'], 'max': opt_config['t']['max']},
-            'rho': {'opt': opt_config['rho']['opt'], 'init': best_params_s1['rho'], 'min': opt_config['rho']['min'], 'max': opt_config['rho']['max']},
-            'E':   {'opt': opt_config['E']['opt'], 'init': best_params_s1['E'], 'min': opt_config['E']['min'], 'max': opt_config['E']['max']},
-            'pz':  {'opt': opt_config['pz']['opt'], 'init': best_params_s1.get('pz', opt_config['pz']['init']), 'min': opt_config['pz']['min'], 'max': opt_config['pz']['max']},
-        }
+        # opt_config_stage2 = {
+        #     't':   {'opt': opt_config['t']['opt'], 'init': best_params_s1['t'], 'min': opt_config['t']['min'], 'max': opt_config['t']['max']},
+        #     'rho': {'opt': opt_config['rho']['opt'], 'init': best_params_s1['rho'], 'min': opt_config['rho']['min'], 'max': opt_config['rho']['max']},
+        #     'E':   {'opt': opt_config['E']['opt'], 'init': best_params_s1['E'], 'min': opt_config['E']['min'], 'max': opt_config['E']['max']},
+        #     'pz':  {'opt': opt_config['pz']['opt'], 'init': best_params_s1.get('pz', opt_config['pz']['init']), 'min': opt_config['pz']['min'], 'max': opt_config['pz']['max']},
+        # }
         
-        weights_stage2 = weights.copy()
-        weights_stage2['mode'] = 5.0   # MAC 가중치 크게 상향
+        # weights_stage2 = weights.copy()
+        # weights_stage2['mode'] = 5.   # MAC 가중치 크게 상향
         
-        model.optimize(opt_config_stage2, weights_stage2, 
-                       use_bead_smoothing=True,     
-                       use_strain_energy=True,      
-                       use_surface_stress=False,    
-                       use_surface_strain=False,    
-                       use_mass_constraint=True, 
-                       mass_tolerance=0.05,
-                       max_iterations=250,           # [Plan v4] Speed-Accuracy Balance
-                       use_early_stopping=True, 
-                       early_stop_patience=60, 
-                       early_stop_tol=1e-8,
-                       learning_rate=0.1,          
-                       num_modes_loss=5,
-                       min_bead_width=150.0,        
-                       mac_search_window=5,         
-                       mode_match_type='hybrid',    
-                       init_pz_from_gt=False,       
-                       gt_init_scale=0.5)           
+        # model.optimize(opt_config_stage2, weights_stage2, 
+        #                use_bead_smoothing=True,     # Stage 1에서 찾은 둥근 형태가 깨지지 않도록 유지
+        #                use_strain_energy=True,      
+        #                use_surface_stress=False,     # 이제 미분 가능
+        #                use_surface_strain=False,     # 이제 미분 가능
+        #                use_mass_constraint=True, 
+        #                mass_tolerance=0.05,
+        #                max_iterations=350,           # Stage 2: MAC 위주의 미세 조정이므로 반복 횟수를 짧게 설정
+        #                use_early_stopping=True, 
+        #                early_stop_patience=150, 
+        #                early_stop_tol=1e-8,
+        #                learning_rate=0.1,          # [안정성 확보] Fine Tuning에서 폭주(발산)하지 않도록 매우 좁은 보폭 적용
+        #                num_modes_loss=5,
+        #                min_bead_width=150.0,        # [핵심] Stage 1과 반드시 동일해야 초기 변형장이 파괴되지 않음
+        #                mac_search_window=5,         # 형상이 복잡해지며 튀어나오는 모드들도 확실하게 캐치하기 위해 넓게 유지
+        #                mode_match_type='hybrid',    # 'mac', 'direct', 'hybrid' (제안된 형상 직접 매칭 방식)
+        #                init_pz_from_gt=False,        # [NEW 옵션] 타겟 Ground Truth 좌표를 기반으로 초기 형태 전사 (사용)
+        #                gt_init_scale=0.5)           # 타겟 Z 변위량의 10% 스케일을 최초 초기값으로 부과
 
         # 7. Verify and Report
         model.verify()
@@ -2019,3 +1446,25 @@ if __name__ == '__main__':
         import traceback
         traceback.print_exc()
         print(f"\n[CRITICAL ERROR] Optimization failed: {e}")
+
+# ==============================================================================
+# [DEVELOPMENT NOTES & FUTURE CONSIDERATIONS]
+# ==============================================================================
+# The following features were implemented but removed in the 2026-02-12 update 
+# due to convergence stability issues. They remains as candidates for future tuning:
+#
+# 1. Automatic Loss Normalization (safe_norm):
+#    - Concept: Dividing each loss component by its initial value to auto-scale weights.
+#    - Issue: Highly accurate initial metrics (e.g., matching frequencies) were 
+#      over-weighted, preventing progress in high-error domains like displacement.
+#
+# 2. Log-scale Frequency Matching (jnp.log):
+#    - Concept: Matching frequency order-of-magnitude.
+#    - Issue: Less sensitive to precision matching (< 1Hz) compared to linear scale 
+#      residual: (curr/tgt - 1)^2.
+#
+# 3. LR Warm-up Cosine Decay Schedule:
+#    - Concept: Starting with very low LR to stabilize initial gradients.
+#    - Issue: Delayed initial convergence for well-posed topography tasks. 
+#      Linear decay from peak LR proved more efficient for current load cases.
+# ==============================================================================

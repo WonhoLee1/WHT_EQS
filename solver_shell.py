@@ -94,6 +94,29 @@ class ShellFEM:
         # nu는 일반적으로 상수 취급
         nu = 0.3 
         
+        # [CRITICAL FIX] Dynamic Geometry for Topography
+        # Z 좌표(pz)가 변경될 때마다 요소의 면적(Area)과 3D 공간 변환 행렬(T_matrix)이 
+        # 미분 가능한 상태로 실시간 업데이트되도록 하여 진짜 3D 강성이 발현되게 합니다.
+        if 'z' in params:
+            # params['z']는 기본 기하 위에 더해지는 Topography(pz) 값입니다.
+            z_total = self.node_coords[:, 2] + params['z'].flatten()
+            nodes_3d = jnp.column_stack([self.node_coords[:, 0], self.node_coords[:, 1], z_total])
+        else:
+            nodes_3d = self.node_coords
+            
+        p1 = nodes_3d[self.elements[:, 0]]
+        p2 = nodes_3d[self.elements[:, 1]]
+        p3 = nodes_3d[self.elements[:, 2]]
+        
+        v12 = p2 - p1
+        e1 = v12 / (jnp.linalg.norm(v12, axis=1, keepdims=True) + 1e-12)
+        n = jnp.cross(e1, p3 - p1)
+        dyn_areas = 0.5 * jnp.linalg.norm(n, axis=1, keepdims=True)
+        e3 = n / (2.0 * dyn_areas + 1e-12)
+        e2 = jnp.cross(e3, e1)
+        dyn_T_3x3 = jnp.stack([e1, e2, e3], axis=1)
+        dyn_areas = dyn_areas.flatten()
+
         # --- VMAP으로 모든 요소의 Local Matrix와 Global Transformation 일괄 계산 ---
         def get_elem_KM(E, t, rho, area, T_3x3):
             # 1. Local 18x18 Matrix 구하기 (Membrane + Bending 6-DOF per node * 3 nodes)
@@ -109,7 +132,7 @@ class ShellFEM:
             return K_glob, M_glob
 
         # 배치 연산 수행
-        K_elems, M_elems = jax.vmap(get_elem_KM)(E_elem, t_elem, rho_elem, self.elem_areas, self.T_3x3)
+        K_elems, M_elems = jax.vmap(get_elem_KM)(E_elem, t_elem, rho_elem, dyn_areas, dyn_T_3x3)
 
         # --- 전체 Global Matrix (희소행렬 구조지만 JAX 호환형 Dense 배열로 조립) ---
         # 노드당 자유도가 6개이므로 1개 요소는 (3개 노드 * 6) = 18 사이즈.

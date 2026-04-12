@@ -1,0 +1,89 @@
+{
+  "twist_case": {
+    "name": "twist_x",
+    "opt_targets": [
+      {
+        "target_type": "rbe_reaction",
+        "rbe_id": "residual",
+        "component": "magnitude",
+        "compare_mode": "relative",
+        "weight": 1.0
+      },
+      {
+        "target_type": "field_stat",
+        "field": "stress_vm",
+        "reduction": "max",
+        "compare_mode": "relative",
+        "weight": 0.3
+      }
+    ]
+  },
+  "twist_y": {
+    "name": "twist_y",
+    "opt_targets": [
+      {"target_type": "rbe_reaction", "rbe_id": "residual", "component": "magnitude", "compare_mode": "relative", "weight": 1.0},
+      {"target_type": "field_stat", "field": "stress_vm", "reduction": "max", "compare_mode": "relative", "weight": 0.3}
+    ]
+  },
+  "bend_x": {
+    "name": "bend_x",
+    "opt_targets": [
+      {"target_type": "field_stat", "field": "max_strain", "reduction": "max", "compare_mode": "relative", "weight": 1.0}
+    ]
+  },
+  "bend_y": {
+    "name": "bend_y",
+    "opt_targets": [
+      {"target_type": "field_stat", "field": "max_strain", "reduction": "max", "compare_mode": "relative", "weight": 1.0}
+    ]
+  },
+  "lift_br": {
+    "name": "lift_br",
+    "opt_targets": [
+      {"target_type": "field_stat", "field": "u_static", "reduction": "max", "compare_mode": "absolute", "ref_value": 5.0, "weight": 1.0}
+    ]
+  },
+  "lift_tl": {
+    "name": "lift_tl",
+    "opt_targets": [
+      {"target_type": "field_stat", "field": "u_static", "reduction": "max", "compare_mode": "absolute", "ref_value": 5.0, "weight": 1.0}
+    ]
+  },
+  "lift_tl_br": {
+    "name": "lift_tl_br",
+    "opt_targets": [
+      {"target_type": "field_stat", "field": "u_static", "reduction": "max", "compare_mode": "absolute", "ref_value": 5.0, "weight": 1.0}
+    ]
+  },
+  "cantilever_x": {
+    "name": "cantilever_x",
+    "opt_targets": [
+      {"target_type": "field_stat", "field": "u_static", "reduction": "max", "compare_mode": "absolute", "ref_value": 5.0, "weight": 1.0}
+    ]
+  },
+  "cantilever_y": {
+    "name": "cantilever_y",
+    "opt_targets": [
+      {"target_type": "field_stat", "field": "u_static", "reduction": "max", "compare_mode": "absolute", "ref_value": 5.0, "weight": 1.0}
+    ]
+  },
+  "pressure_z": {
+    "name": "pressure_z",
+    "opt_targets": [
+      {"target_type": "field_stat", "field": "u_static", "reduction": "rms", "compare_mode": "absolute", "ref_value": 10.0, "weight": 1.0}
+    ]
+  },
+  "mass_constraint": {
+    "target_type": "mass",
+    "compare_mode": "relative",
+    "ref_value": 5.0,
+    "tolerance": 0.05,
+    "weight": 10.0
+  },
+  "modal": {
+    "target_type": "modes",
+    "compare_mode": "mac",
+    "weight": 1.0,
+    "num_modes": 5
+  }
+}

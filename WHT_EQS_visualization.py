@@ -303,7 +303,7 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
             print("\n Available Modes:")
             print(" 0: [SPLIT VIEW] View All Modes")
             for i, val in enumerate(vals):
-                freq_hz = np.sqrt(max(0, val)) / (2 * np.pi)
+                freq_hz = float(val) # Already in Hz
                 print(f" Mode {i+1}: {freq_hz:.2f} Hz")
                 
             try:
@@ -330,7 +330,7 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
                         r, c = i // cols, i % cols
                         p.subplot(r, c)
                         
-                        freq_hz = np.sqrt(max(0, vals[i])) / (2 * np.pi)
+                        freq_hz = float(vals[i]) # Already in Hz
                         w_mode = np.array(modes[:, i])
                         
                         grid = pv.StructuredGrid()
@@ -346,7 +346,7 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
                     p.show()
                 
                 elif 0 <= m_idx < len(vals):
-                    freq_hz = np.sqrt(max(0, vals[m_idx])) / (2 * np.pi)
+                    freq_hz = float(vals[m_idx]) # Already in Hz
                     
                     # Prepare Mesh for Mode Shape
                     w_mode = np.array(modes[:, m_idx])
@@ -446,10 +446,15 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
             stats_text = "Statistics not available (Run with updated main_verification.py)"
 
         # Prepare Mesh
-        w_disp = np.array(tgt['u_static'])
         grid = pv.StructuredGrid()
-        z_deformed = z + w_disp * scale
-        grid.points = np.column_stack([x, y, z_deformed])
+        if 'u_full' in tgt:
+            u_vec = np.array(tgt['u_full']).reshape(-1, 6)[:, :3]
+            pts_deformed = np.column_stack([x, y, z]) + u_vec * scale
+            grid.points = pts_deformed
+        else:
+            w_disp = np.array(tgt['u_static'])
+            z_deformed = z + w_disp * scale
+            grid.points = np.column_stack([x, y, z_deformed])
         grid.dimensions = [nx + 1, ny + 1, 1]
         grid[field_name] = scalars
         
@@ -488,11 +493,7 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
             fixed_nodes = np.unique(fixed_dofs // 6)
             
             # Extract coordinates for fixed nodes
-            bc_coords = np.column_stack([
-                x[fixed_nodes], 
-                y[fixed_nodes], 
-                z_deformed[fixed_nodes]
-            ])
+            bc_coords = grid.points[fixed_nodes]
             
             # Add BC points
             p.add_points(
@@ -515,11 +516,7 @@ def stage2_visualize_ground_truth(fem, targets, params, eigen_data=None):
             loaded_nodes = np.where((force_mag > 1e-6) | (moment_mag > 1e-6))[0]
             
             if len(loaded_nodes) > 0:
-                load_coords = np.column_stack([
-                    x[loaded_nodes], 
-                    y[loaded_nodes], 
-                    z_deformed[loaded_nodes]
-                ])
+                load_coords = grid.points[loaded_nodes]
                 
                 # Add Load points
                 p.add_points(
@@ -638,19 +635,34 @@ def stage3_visualize_comparison(fem_target, fem_optimized, targets, optimized_pa
             units = "mm"
             cmap = "viridis"
         elif choice == '3' and opt_eigen and tgt_eigen:
-            # Mode Shape Selection
-            print("\n Select Mode for Comparison:")
+            # [WHTOOLS] Smart Mode Filtering: Skip Rigid Body Modes (F < 0.1 Hz)
+            elastic_indices = []
             for i in range(len(tgt_eigen['vals'])):
-                f_t = np.sqrt(max(0, tgt_eigen['vals'][i])) / (2*np.pi)
-                f_o = np.sqrt(max(0, opt_eigen['vals'][i])) / (2*np.pi)
-                print(f" Mode {i+1}: Target={f_t:.1f}Hz, Opt={f_o:.1f}Hz")
+                f_t = float(tgt_eigen['vals'][i]) # Already in Hz
+                if f_t > 0.1: # Threshold for elastic modes
+                    elastic_indices.append(i)
+            
+            if not elastic_indices:
+                print("[WARNING] No elastic modes found (> 0.1 Hz).")
+                continue
+
+            print("\n Select Elastic Mode for Comparison (Skipping RBMs):")
+            for idx, i in enumerate(elastic_indices):
+                f_t = float(tgt_eigen['vals'][i])
+                f_o = float(opt_eigen['vals'][i])
+                print(f" Display Mode {idx+1} (Internal Index {i}): Target={f_t:.1f}Hz, Opt={f_o:.1f}Hz")
+            
             try:
-                m_idx = int(input(">> Mode number: ")) - 1
+                m_choice = int(input(">> Mode number to display: ")) - 1
+                if m_choice < 0 or m_choice >= len(elastic_indices):
+                    raise ValueError("Out of range")
+                
+                m_idx = elastic_indices[m_choice]
                 data_target = tgt_eigen['modes'][:, m_idx]
                 data_optimized = opt_eigen['modes'][:, m_idx]
-                f_target = np.sqrt(max(0, tgt_eigen['vals'][m_idx])) / (2*np.pi)
-                f_opt = np.sqrt(max(0, opt_eigen['vals'][m_idx])) / (2*np.pi)
-                field_name = f"Mode_{m_idx+1}_Shape"
+                f_target = float(tgt_eigen['vals'][m_idx])
+                f_opt = float(opt_eigen['vals'][m_idx])
+                field_name = f"Mode_{idx+1}_Shape"
                 units = "Rel"
                 cmap = "coolwarm"
             except:

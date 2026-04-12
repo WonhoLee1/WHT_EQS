@@ -782,6 +782,41 @@ class PlateFEM:
         
         return vals[:num_modes], vecs_u[:, :num_modes]
 
+    def solve_eigen_arpack_jax_compatible(self, K, M, num_modes, num_skip):
+        """
+        JAX-friendly compatibility wrapper used by higher-level code expecting
+        an ARPACK-style interface. If inputs are sparse or numpy arrays,
+        convert to JAX arrays and call the internal `solve_eigen` implementation.
+        This keeps the eigen computation inside JAX (differentiable) while
+        providing the same calling convention used elsewhere in the codebase.
+        """
+        # Accept scipy sparse or numpy arrays too
+        try:
+            import scipy.sparse as sp
+            if sp.issparse(K):
+                K = K.toarray()
+            if sp.issparse(M):
+                M = M.toarray()
+        except Exception:
+            # scipy may not be available in some minimal environments
+            pass
+
+        # Convert to JAX arrays if needed
+        if not isinstance(K, jnp.ndarray):
+            K = jnp.array(K)
+        if not isinstance(M, jnp.ndarray):
+            M = jnp.array(M)
+
+        # Ask internal solver for enough modes including skipped ones
+        total_modes = int(num_modes) + int(num_skip)
+        vals_all, vecs_all = self.solve_eigen(K, M, num_modes=total_modes)
+
+        # Slice out skipped rigid-body / trivial modes
+        vals = vals_all[num_skip: num_skip + num_modes]
+        vecs = vecs_all[:, num_skip: num_skip + num_modes]
+
+        return vals, vecs
+
     def compute_curvature(self, u):
         """
         Compute curvature field (strain for plate bending) from displacement.
