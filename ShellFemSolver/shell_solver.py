@@ -294,9 +294,20 @@ class ShellFEM:
         n_n = self.nodes.shape[0]; E = jnp.atleast_1d(jnp.array(params.get('E', 210000.0))); t = jnp.atleast_1d(jnp.array(params.get('t', 1.0)))
         if E.shape[0] == 1: E = jnp.full(n_n, E[0]); 
         if t.shape[0] == 1: t = jnp.full(n_n, t[0]);
-        rho = jnp.atleast_1d(jnp.array(params.get('rho', 7.85e-9))); 
+        rho = jnp.atleast_1d(jnp.array(params.get('rho', 7.85e-9)))
         if rho.shape[0] == 1: rho = jnp.full(n_n, rho[0])
-        nu = 0.3; cur_n = self.nodes; Kg = jnp.zeros((self.total_dof, self.total_dof)); Mg = jnp.zeros((self.total_dof, self.total_dof))
+        nu = 0.3
+        
+        # [CRITICAL FIX] Restore Topography Awareness
+        cur_n = self.nodes
+        if 'z' in params:
+            z_val = jnp.atleast_1d(jnp.array(params['z']))
+            if z_val.shape[0] == 1:
+                cur_n = cur_n.at[:, 2].add(z_val[0])
+            elif z_val.shape[0] == n_n:
+                cur_n = cur_n.at[:, 2].add(z_val)
+                
+        Kg = jnp.zeros((self.total_dof, self.total_dof)); Mg = jnp.zeros((self.total_dof, self.total_dof))
         if self.quads.shape[0] > 0:
             ec = cur_n[self.quads]; v12 = ec[:,1,:]-ec[:,0,:]; Lx = jnp.linalg.norm(v12, axis=1, keepdims=True).clip(1e-12); e1 = v12/Lx
             v14 = ec[:,3,:]-ec[:,0,:]; nrm = jnp.cross(e1, v14); e3 = nrm/jnp.linalg.norm(nrm, axis=1, keepdims=True).clip(1e-12); e2 = jnp.cross(e3, e1)
@@ -334,7 +345,8 @@ class ShellFEM:
         return coo_matrix((np.concatenate(KV),(np.concatenate(R),np.concatenate(C))), (self.total_dof,self.total_dof)).tocsr(), coo_matrix((np.concatenate(MV),(np.concatenate(R),np.concatenate(C))), (self.total_dof,self.total_dof)).tocsr()
 
     def solve_eigen(self, K, M, num_modes=10, num_skip=0):
-        md = jnp.maximum(jnp.diag(M), 1e-15); mis = 1.0/jnp.sqrt(md); A = ((K+K.T)/2.0) * mis[:,None] * mis[None,:] + jnp.eye(K.shape[0])*1e-10
+        A = ((K+K.T)/2.0) * mis[:,None] * mis[None,:]
+        A = A.at[jnp.diag_indices(A.shape[0])].add(1e-10)
         vals, vecs = safe_eigh(A); freqs = jnp.sqrt(jnp.maximum(vals, 0.0))/(2*jnp.pi); vp = vecs * mis[:,None]
         return freqs[num_skip:num_skip+num_modes], vp[:, num_skip:num_skip+num_modes]
 
@@ -402,7 +414,10 @@ class ShellFEM:
 
     def solve_static_partitioned(self, K, F, free_dofs, fixed_dofs, fixed_vals):
         Kff = K[jnp.ix_(free_dofs, free_dofs)]; rhs = F[free_dofs] - K[jnp.ix_(free_dofs, fixed_dofs)] @ fixed_vals
-        uf = jnp.linalg.solve(Kff + 1e-8*jnp.eye(Kff.shape[0]), rhs)
+        # [OPTIMIZATION] Avoid dense jnp.eye(n) which consumes O(N^2) memory.
+        # Add small regularization directly to the diagonal.
+        K_reg = Kff.at[jnp.diag_indices(Kff.shape[0])].add(1e-8)
+        uf = jnp.linalg.solve(K_reg, rhs)
         return jnp.zeros(self.total_dof).at[free_dofs].set(uf).at[fixed_dofs].set(fixed_vals)
 
     def solve_static_sparse(self, K, F, free_dofs, fixed_dofs, fixed_vals):

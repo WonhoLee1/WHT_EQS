@@ -15,6 +15,13 @@
 import os
 os.environ["NON_INTERACTIVE"] = "1"
 import sys
+# [CRITICAL FIX] Windows 콘솔 인코딩 문제 해결 (Python 3.7+ 표준 방식)
+if sys.platform == "win32":
+    # sys.stdout이 이미 io.TextIOWrapper라면 reconfigure() 사용 가능
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 import msvcrt
 import time
 import jax
@@ -31,6 +38,7 @@ from main_shell_verification import (
 )
 from opt_targets import OptTarget, TargetType, apply_case_targets_from_spec
 from solver import safe_eigh  # [CRITICAL FIX 27] 안전한 고유치 미분을 위한 임포
+from wh_utils import WHTable, wh_print_banner # [UI] 분리된 전용 유틸리티 사용
 
 def optimize_v2(self, opt_config, opt_target_config,
                 use_bead_smoothing=False,
@@ -50,13 +58,14 @@ def optimize_v2(self, opt_config, opt_target_config,
     JSON 명세 또는 Dictionary 형태의 opt_target_config를 직접 입력받아
     각 케이스/글로벌 목적 함수를 동적으로 평가하고 JAX 최적화 루프에 반영합니다.
     """
-    print("\n" + "="*80)
-    print(" [STAGE 3] OPT-TARGET DRIVEN OPTIMIZATION (V2)")
-    print("="*80)
+    wh_print_banner("STAGE 3: OPT-TARGET DRIVEN OPTIMIZATION (V2)")
 
     Nx_l, Ny_l = self.fem.nx, self.fem.ny
-    pts_l = np.array(self.fem.node_coords[:, :2])
-    pts_h = np.array(self.fem_high.node_coords[:, :2])
+    # [ROBUST] Use ACTUAL 3D nodal coordinates from the Mesh objects
+    # Using [:, :3] instead of [:, :2] prevents "Dimension Collapse" on vertical walls 
+    # which was causing MAC=0.0 matching failures.
+    pts_l = np.array(self.fem.nodes)[:, :3]
+    pts_h = np.array(self.fem_high.nodes)[:, :3]
     
     # 1. 대상 모델에 OptTarget 설정 적용
     if hasattr(self, 'global_opt_targets'):
@@ -66,7 +75,21 @@ def optimize_v2(self, opt_config, opt_target_config,
             case.opt_targets.clear()
             
     apply_case_targets_from_spec(self, opt_target_config)
+    
+    # [FINAL DEFINITIVE FIX] apply_case_targets_from_spec\uc740 'global_targets' \ud0a4\uc758 list\ub97c
+    # case\uc774\ub984\uc73c\ub85c \ucc2d\uace0 \ud574\ub2f9 case\uac00 \uc5c6\uc73c\uba74 \uc870\uc6a9\ud788 \ubb35\uc0b4\ud569\ub2c8\ub2e4.
+    # -> \ud574\ub2f9 \ud0c0\uac9f\uc774 self.global_opt_targets\uc5d0 \uc808\ub300 \ubc14\uc778\ub529\ub418\uc9c0 \uc54a\uc544 modes/mass\ub97c \uc801\uc6a9 \ubd88\ub9c9 -> MAC=0, dt=0
+    # \uc774\ub97c \uc9c1\uc811 \ud30c\uc2f1\ud558\uc5ec \ub4f1\ub85d\ud569\ub2c8\ub2e4.
+    from opt_targets import parse_opt_targets
+    if not hasattr(self, 'global_opt_targets'):
+        self.global_opt_targets = []
+    raw_globals = opt_target_config.get('global_targets', [])
+    if raw_globals:
+        self.global_opt_targets.extend(parse_opt_targets(raw_globals))
+        print(f" -> Global targets registered: {[ot.target_type.value for ot in self.global_opt_targets]}")
+    
     print(" -> OptTarget configuration applied to model cases.")
+
 
     # 2. GT(Ground Truth) 보간 (고해상도 -> 저해상도)
     self.targets_low = []
@@ -121,7 +144,7 @@ def optimize_v2(self, opt_config, opt_target_config,
             'max_strain': jnp.array(strain_l),
             'strain_energy_density': jnp.array(sed_l),
             'reaction_sums': target_R_sums,
-            'reaction_full': jnp.array(R_l_full)  # 차원 붕괴가 수정된 스케일 보정 벡터 저장
+            'reaction_full': jnp.array(R_l_full)
         })
 
     # 모드 및 Z-좌표 매핑
@@ -134,26 +157,56 @@ def optimize_v2(self, opt_config, opt_target_config,
     t_vals = np.array(self.target_eigen['vals'])[:num_modes_loss]
     t_modes_h_np = np.array(self.target_eigen['modes'])
     
-    # [CRITICAL FIX 30] Modal Displacement Mapping Collapse 방지
-    # 고해상도 모드 데이터(t_modes_h_np)는 6-DOF 전체 벡터입니다.
-    # 이를 Z-방향 성분([2::6])만 추출하지 않고 그대로 보간(safe_interp)하면,
-    # 서로 다른 물리량(u, v, w, thx...)이 노드 위치에 따라 뒤섞여 MAC 연산이 원천적으로 불가능해집니다(MAC=0).
-    # 따라서 보간 전에 타겟 모델의 Z-방향 모드 형상만 정확히 분리합니다.
-    if is_same_res:
-        t_modes_l = jnp.array(t_modes_h_np[2::6, :num_modes_loss])
-    else:
-        # [CRITICAL FIX 31] Interpolation Point Count Mismatch 방지
-        # t_modes_h_np[2::6, :] 방식은 전체 DOF 배열 구조에 따라 pts_h와 개수가 어긋날 위험이 있습니다.
-        # 명시적으로 (노드 수, 6-DOF, 모드 수)로 reshape 하여 3번째(w-변위) 성분만 정확히 추출합니다.
-        n_h = len(pts_h)
-        # t_modes_h_np shape: (Total_DOF, num_modes) -> (Nodes, 6, num_modes)
-        t_modes_res = t_modes_h_np.reshape(-1, 6, t_modes_h_np.shape[1])
-        t_modes_h_z = t_modes_res[:n_h, 2, :] # 정확히 Z-변위 채널만 추출
-        
-        t_modes_l = jnp.stack([safe_interp(pts_h, t_modes_h_z[:, i], pts_l) for i in range(len(t_vals))], axis=1)
+    # [STAGE 1: FUNDAMENTAL FIX] Parametric Modal Projection (Multi-Resolution Tech)
+    # 3D jittered 보간은 지형 변화 시 매핑 위치가 어긋나는 본질적 불안정함이 있습니다.
+    # 대신 셸 본연의 파라미터 공간(Lx, Ly)에서의 2D 정규화 보간을 통해 정합성을 100% 확보합니다.
+    xh_base = np.linspace(0, self.fem.Lx, Nx_high + 1)
+    yh_base = np.linspace(0, self.fem.Ly, Ny_high + 1)
+    XH, YH = np.meshgrid(xh_base, yh_base, indexing='xy')
     
-    # 디버그: MAC 계산에 사용될 타겟 모드 차원 확인
-    print(f" -> Mode Mapping Complete. Target Mode Shape: {t_modes_l.shape} (DOF x Modes)")
+    xl_base = np.linspace(0, self.fem.Lx, Nx_l + 1)
+    yl_base = np.linspace(0, self.fem.Ly, Ny_l + 1)
+    XL, YL = np.meshgrid(xl_base, yl_base, indexing='xy')
+
+    n_h = len(pts_h)
+    
+    if is_same_res:
+        # [BUG FIX 1] target_eigen['modes']는 generate_targets에서 이미 Z-변위만 저장됨
+        # (N_nodes, n_modes) 형태 — reshape(-1,6,...) 이중 슬라이싱하면 데이터 오염!
+        t_modes_l = jnp.array(t_modes_h_np[:n_h, :num_modes_loss])
+    else:
+        # 6-DOF 전체 데이터에서 Z-변위(index 2) 추출 (이미 Z-only면 패스)
+        n_total_rows = t_modes_h_np.shape[0]
+        if n_total_rows == n_h * 6:
+            # [rare] full 6-DOF stored
+            t_modes_res = t_modes_h_np.reshape(-1, 6, t_modes_h_np.shape[1])
+            t_modes_h_z = t_modes_res[:n_h, 2, :]
+        elif n_total_rows == n_h:
+            # [normal] already Z-only (N_h_nodes, n_modes)
+            t_modes_h_z = t_modes_h_np
+        else:
+            # fallback: take first n_h rows
+            t_modes_h_z = t_modes_h_np[:n_h, :]
+
+        # [WHTOOLS Technology] 2D Parametric Projection
+        # 수직벽이 있는 트레이 형상이라도 모드 형상(w)은 바닥면 그리드 위에서 정의되므로
+        # 2D 좌표(XH, YH) -> (XL, YL) 매핑이 가장 정확하고 본질적인 매핑 방법입니다.
+        from scipy.interpolate import griddata as scipy_griddata
+        pts_h_2d = np.stack([XH.flatten(), YH.flatten()], axis=1)
+        pts_l_2d = np.stack([XL.flatten(), YL.flatten()], axis=1)
+        
+        t_modes_l_list = []
+        for i in range(num_modes_loss):
+            mapped = scipy_griddata(pts_h_2d, t_modes_h_z[:, i], pts_l_2d, method='linear')
+            # NaN 발생 시 Nearest로 보정하여 불연속성 최소화
+            nan_mask = np.isnan(mapped)
+            if np.any(nan_mask):
+                mapped[nan_mask] = scipy_griddata(pts_h_2d, t_modes_h_z[:, i], pts_l_2d[nan_mask], method='nearest')
+            t_modes_l_list.append(mapped)
+            
+        t_modes_l = jnp.array(np.stack(t_modes_l_list, axis=1))
+    
+    print(f" -> Fundamental Multi-Res Mapping: {t_modes_l.shape} nodes/modes matched via 2D Parametric Space.")
         
     target_z_low = None
     if 'z' in self.target_params_high:
@@ -291,11 +344,9 @@ def optimize_v2(self, opt_config, opt_target_config,
 
         if 'pz' in combined_phys:
             pz_val = combined_phys['pz']
-            # [CRITICAL FIX 21] Shape Transpose 버그 수정 (Ny, Nx -> Nx, Ny)
             z_map = jnp.full((Nx_l+1, Ny_l+1), pz_val[0]) if (pz_val.ndim == 1 and pz_val.shape[0] == 1) else combined_phys['pz']
-            
-            # [CRITICAL FIX 22] 동적 지지대 마스킹: 테두리뿐만 아니라 고정(Fixed)된 모든 지점의 Z 이동을 원천 차단
-            combined_phys['z'] = (z_map.flatten() * z_lock_mask_1d).reshape(Nx_l+1, Ny_l+1)
+            z_masked = (z_map.flatten() * z_lock_mask_1d)  # 1D flat (N_nodes,)
+            combined_phys['z'] = z_masked  # [BUG FIX 2] 솔버는 1D flat 배열만 인식: shape==(n_n,)
 
         def broadcast_nodal(val):
             return jnp.full(((Nx_l+1)*(Ny_l+1),), val[0]) if val.ndim == 1 and val.shape[0] == 1 else val.flatten()
@@ -496,7 +547,24 @@ def optimize_v2(self, opt_config, opt_target_config,
                     fw = float(desc.get('freq_weight', 0.0))
                     nmode = int(desc.get('num_modes') or len(t_vals))
                     if vecs_filtered is not None and freqs is not None:
+                        # [MAC ROOT-CAUSE FIX]
+                        # vecs_filtered는 전체 DOF 공간(total_dof, n_modes)에서 이미 증덧행렬으로
+                        # 쪼바로 계산된 고유벡터입니다.
+                        # self.fem.free_dof가 없으므로, 제로패딩 후 scatter는 증복 인덱싱 오류를 유발.
+                        # -> 단순히 [2::6] 슬라이싱만으로 Z-변위 성분을 정확히 추출합니다.
                         cand_modes = vecs_filtered[2::6, :]
+                        
+                        # [SHAPE DIAGNOSTIC - MAC=0 추적]
+                        if jax.numpy.ndim(cand_modes) == 2:
+                            import jax.debug as jdebug
+                            jdebug.print("[SHAPE] t_modes_l: {s1}, cand_modes: {s2}", 
+                                        s1=t_modes_l.shape[0], s2=cand_modes.shape[0])
+                            jdebug.print("[NORM]  norm_t_max: {nt:.4e}, norm_c_max: {nc:.4e}",
+                                        nt=jnp.max(jnp.sum(t_modes_l**2, axis=0)),
+                                        nc=jnp.max(jnp.sum(cand_modes**2, axis=0)))
+                        
+                        # [DEBUG] MAC 연산 차원 정합성 강제 확인 (Nodes, Modes)
+                        # dots shape: (TargetModes, CandModes)
                         dots = jnp.dot(t_modes_l.T, cand_modes)
                         norm_t = jnp.sum(t_modes_l**2, axis=0, keepdims=True)
                         norm_c = jnp.sum(cand_modes**2, axis=0, keepdims=True)
@@ -561,7 +629,7 @@ def optimize_v2(self, opt_config, opt_target_config,
             'freqs': freqs,
             'vecs_filtered': vecs_filtered,
             'matched_freqs': matched_freqs if (has_mode_target and 'matched_freqs' in locals()) else None,
-            'best_mac': best_mac if (has_mode_target and 'best_mac' in locals()) else None
+            'best_mac': best_mac if 'best_mac' in locals() else None
         }
 
     # [이론적 배경: Two-Track JIT 아키텍처와 미분 무결성 (Gradient Integrity)]
@@ -587,8 +655,16 @@ def optimize_v2(self, opt_config, opt_target_config,
     last_matched_freqs, last_best_mac = None, None
     print(f"\n [PERFORMANCE] Eigen Decomposition occurs every {eigen_freq} iterations.")
     
-    # [CRITICAL FIX 10] 모드 타겟이 없을 경우 불필요한 고유치 해석(O(N^3)) 원천 차단
-    has_mode_target = any(d['type'] == 'modes' for d in targets_jax)
+    # [FINAL ROOT-CAUSE FIX] 'global' 키가 아니라 'global_targets'가 실제 키입니다.
+    # -> 항상 빈 리스트 반환 -> has_mode_target = False -> Iter 1부터 고유치 해석 완전 차단
+    # -> vecs_filtered = None 고정 -> MAC 연산 자체가 실행되지 않음 -> MAC=0 고정
+    has_mode_target = (
+        any(str(d.get('type','')).lower() in ['modes', 'modal', 'frequency', 'freq'] 
+            for d in opt_target_config.get('global_targets', []))  # correct key
+        or any(str(d.get('type','')).lower() in ['modes', 'modal', 'frequency', 'freq']
+               for d in targets_jax if d.get('case_idx') is None)  # fallback from serialised
+    )
+    print(f" [MODAL] Mode target detected: {has_mode_target}")
 
     for i in range(max_iterations):
         iter_start = time.time()
@@ -603,6 +679,14 @@ def optimize_v2(self, opt_config, opt_target_config,
         
         if compute_eigen_now:
             (val, aux), grads = loss_vg_with_eigen(params, fixed_params_scaled)
+            
+            # [DIAGNOSTIC] Gradient Flow Monitoring
+            # 왜 dt=0 인지, 본질적인 기울기 소멸 여부를 확인합니다.
+            if i == 0:
+                print("\n [DIAGNOSTIC] Gradient Norms at Iter 0:")
+                for k, g in grads.items():
+                    print(f"  ╰── {k}: {jnp.linalg.norm(g):.4e}")
+            
             cached_freqs = aux['freqs']
             cached_vecs = aux['vecs_filtered']
             cached_f1_hz = aux['f1_hz']
@@ -642,45 +726,87 @@ def optimize_v2(self, opt_config, opt_target_config,
             dpz_max = jnp.abs(params['pz'] - prev_params['pz']).max() * scaling_consts['pz']
             dt_avg = jnp.abs(params['t'] - prev_params['t']).mean() * scaling_consts['t']
             dpz_avg = jnp.abs(params['pz'] - prev_params['pz']).mean() * scaling_consts['pz']
-            sens_info = f" | dt:{dt_max:.3f}(avg:{dt_avg:.4f}) | dz:{dpz_max:.3f}(avg:{dpz_avg:.4f})"
+            sens_info = f" | dt:{dt_max:.6f}(avg:{dt_avg:.7f}) | dz:{dpz_max:.4f}(avg:{dpz_avg:.5f})"
         else:
             sens_info = ""
         prev_params = jax.tree_util.tree_map(jnp.array, params)
+        
+        # [WHTOOLS] [NEW] Track and Print Global Physical Values
+        if i % 5 == 0:
+            t_phys = float(params.get('t', fixed_params_scaled.get('t'))[0]) * scaling_consts['t']
+            rho_phys = float(params.get('rho', fixed_params_scaled.get('rho'))[0]) * scaling_consts['rho']
+            E_phys = float(params.get('E', fixed_params_scaled.get('E'))[0]) * scaling_consts['E']
+            print(f" ╰─── 🧪 Globals: t={t_phys:.5f}mm | rho={rho_phys:.3e} | E={E_phys:.1f}MPa")
 
         iter_time = time.time() - iter_start
         if i != 0:
-            print(f"\r [Iter {i:04d}/{max_iterations}] {iter_time:.2f}s | Loss: {float(val):.4e}{sens_info}")
+            print(f"\r 🔄 [Iter {i:04d}/{max_iterations}] {iter_time:4.2f}s | Loss: {float(val):.5e}{sens_info}")
         else:
-            print(f" [Iter {i:04d}/{max_iterations}] {iter_time:.2f}s (C+E) | Loss: {float(val):.4e}")
+            print(f" 🚀 [Iter {i:04d}/{max_iterations}] {iter_time:4.2f}s (C+E) | Loss: {float(val):.5e}")
 
         # 상세 출력 및 보고 - [WHTOOLS] 첫 이터레이션(Iter 0) 및 10회 주기마다 출력
         if i % 10 == 0 or i == 0:
             evals = np.array(aux['target_evals'])
-            print(f"\n[{i:04d}] OptTarget Evaluation Report")
-            print(f"| {'Case/Global':<14} | {'Type':<12} | {'Field':<18} | {'Mode':<8} | {'Target Val':<11} | {'Current Val':<11} | {'Error':<11} | {'Weight':<6} |")
-            print("-" * 110)
+            
+            # --- OptTarget Evaluation Report Improvement ---
+            # [WHTOOLS] ICE 엔진을 사용하여 헤더와 내용에 이모지가 자동 할당됩니다.
+            table = WHTable(["Case", "Type", "Field", "Target Val", "Current Val", "Error", "Status"], 
+                            title=f"OPTIMIZATION TARGET REPORT [ITER {i:04d}]")
+            table.set_aligns(['left', 'left', 'left', 'right', 'right', 'right', 'center'])
+            
             for d_idx, info in enumerate(target_info):
                 v, r_v, err, w = evals[d_idx]
-                print(f"| {info['case']:<14} | {info['type']:<12} | {info['field']:<18} | {info.get('mode', ''):<8} | {r_v:<11.4e} | {v:<11.4e} | {err:<11.4e} | {w:<6.2f} |")
-            print("-" * 110)
+                
+                # Status Emoji (자동 할당 지원 안 하므로 수동 처리 유지)
+                abs_err = abs(float(err))
+                if abs_err < 0.05: status = "✅"
+                elif abs_err < 0.20: status = "🟡"
+                else: status = "❌"
+                
+                # Case 및 Type 컬럼은 WHTable 내부의 ICE 엔진이 "Twist", "Stress", "Mass" 등의 키워드를 포착하여
+                # 자동으로 이모지를 붙여줍니다.
+                table.add_row([
+                    info['case'],
+                    info['type'],
+                    info['field'],
+                    f"{r_v:.4e}",
+                    f"{v:.4e}",
+                    f"{err:+.4f}",
+                    status
+                ], smart_cols=[0, 1, 2]) # 특정 컬럼에만 스마트 이모지 적용 가능
+            table.print()
             
-            # --- Mode Frequencies Output --- [WHTOOLS] 데이터 존재 시 무조건 출력
+            # --- Mode Frequencies Output Improvement ---
             if cached_freqs is not None:
-                # [WHTOOLS] [NEW] Enhanced Modal Comparison Table
+                m_table = WHTable(["Mode", "Target (Hz)", "Current (Hz)", "Error (%)", "MAC", "Quality"], 
+                                  title="MODAL PERFORMANCE ANALYTICS")
+                m_table.set_aligns(['center', 'right', 'right', 'right', 'right', 'center'])
+                
                 c_hz = np.array(aux['matched_freqs']) if aux.get('matched_freqs') is not None else np.array(cached_freqs)
                 t_hz = np.array(t_vals)
                 best_mac = np.array(aux['best_mac']) if aux.get('best_mac') is not None else None
                 n_f = min(len(c_hz), len(t_hz))
                 
-                print(f"| {'Mode':^8} | {'Target (Hz)':^15} | {'Current (Hz)':^15} | {'Error (%)':^12} | {'MAC':^10} |")
-                print("-" * 75)
                 for m_idx in range(n_f):
                     err_hz = (c_hz[m_idx] - t_hz[m_idx]) / (t_hz[m_idx] + 1e-12) * 100.0
-                    mac_val = best_mac[m_idx] if best_mac is not None else 0.0
-                    print(f"| {m_idx+1:^8} | {t_hz[m_idx]:15.2f} | {c_hz[m_idx]:15.2f} | {err_hz:12.2f} | {mac_val:10.4f} |")
-                print("-" * 75)
-                print("-" * 110)
-            print(f"Total Loss (with Reg): {float(val):.6e}")
+                    mac_val = float(best_mac[m_idx]) if best_mac is not None else 0.0
+                    
+                    # MAC Quality 등급 (ICE 엔진의 'quality' 키워드로 보조 가능)
+                    if mac_val > 0.95: q_desc = "Excellent"
+                    elif mac_val > 0.85: q_desc = "High"
+                    elif mac_val > 0.50: q_desc = "Good"
+                    else: q_desc = "Poor"
+                    
+                    m_table.add_row([
+                        f"#{m_idx+1}",
+                        f"{t_hz[m_idx]:.2f}",
+                        f"{c_hz[m_idx]:.2f}",
+                        f"{err_hz:+.2f}%",
+                        f"{mac_val:.4f}",
+                        f"{q_desc} Quality" # Quality 키워드 포함 시 ICE 엔진이 메달 이모지 등을 붙여줌
+                    ])
+                m_table.print()
+            print(f"💰 [SYSTEM] Total Loss (with Reg): {float(val):.6e}")
 
         if msvcrt.kbhit() and msvcrt.getch() in [b'q', b'Q']:
             print("\n [USER INTERRUPT] Terminating early...")
@@ -788,9 +914,11 @@ if __name__ == '__main__':
             ]
         },
         # [글로벌 제약 조건] 질량 및 고유 진동 모드
+        # [BUG FIX 3] mass weight(5) >> modes weight(1) 이었으산 두께를 즌이면 주파수를 올리는 방향보다
+        # 질량을 줄이는 방향이 5배 더 크게 보상 주어졌으므로 dt=0.8로 수렴 → 교정
         "global_targets": [
-            {"target_type": "mass", "compare_mode": "relative", "tolerance": 0.05, "weight": 5.0},
-            {"target_type": "modes", "compare_mode": "mac", "num_modes": 3, "weight": 1.0}
+            {"target_type": "mass", "compare_mode": "relative", "tolerance": 0.05, "weight": 1.0},
+            {"target_type": "modes", "compare_mode": "mac", "num_modes": 3, "freq_weight": 0.5, "weight": 5.0}
         ]
     }
     

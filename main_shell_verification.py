@@ -51,14 +51,16 @@ class EquivalentSheetModel:
     def add_case(self, case):
         self.cases.append(case)
 
-    def generate_targets(self, resolution_high=(50, 20), 
-                        num_modes_save=5, 
-                        target_config=None,
-                        cache_file="", #"ground_truth_cache.pkl"
-                        ):
+    def generate_targets(self, resolution_high=(120, 60), num_modes_save=5, cache_file="target_cache.pkl", target_config={}):
+        """
+        Generates ground truth data using a high-fidelity model.
+        """
         print("\n" + "="*70)
         print(" [STAGE 1] TARGET GENERATION & PATTERN VERIFICATION")
         print("="*70)
+        
+        # [BUGFIX] Store target_config in model for later use in verify()
+        self.config['target_config'] = target_config
         self.resolution_high = resolution_high
         Nx_h, Ny_h = resolution_high
         
@@ -393,6 +395,11 @@ class EquivalentSheetModel:
                     except IndexError:
                         print(f"  - Case {case.name}: no matching ResultBundle (skip)")
                         continue
+                    # [ROBUST] Use ACTUAL 3D nodal coordinates from the Mesh objects
+                    # Using [:, :3] instead of [:, :2] prevents "Dimension Collapse" on vertical walls 
+                    # which was causing MAC=0.0 matching failures.
+                    pts_h = np.array(self.fem_high.nodes)[:, :3]
+                    pts_l = np.array(self.fem.nodes)[:, :3]
                     for t_idx, ot in enumerate(case.opt_targets):
                         err, details = ot.compute_error(bundle, ref_bundle=bundle)
                         print(f"  - Case {case.name} Target#{t_idx}: err={err:.6e}, details={details}")
@@ -419,9 +426,9 @@ class EquivalentSheetModel:
         Nx_h, Ny_h = self.resolution_high
         Nx_l, Ny_l = self.fem.nx, self.fem.ny
         
-        # [ROBUST] Use ACTUAL nodal coordinates from the Mesh objects (supports Tray/Box geometries)
-        pts_h = np.array(self.fem_high.nodes)[:, :2]
-        pts_l = np.array(self.fem.nodes)[:, :2]
+        # [ROBUST] Use ACTUAL 3D nodal coordinates from the Mesh objects
+        pts_h = np.array(self.fem_high.nodes)[:, :3]
+        pts_l = np.array(self.fem.nodes)[:, :3]
         
         self.targets_low = []
         is_same_res = bool(Nx_h == Nx_l and Ny_h == Ny_l)
@@ -1781,6 +1788,7 @@ class EquivalentSheetModel:
         report = []
         report.append("# 📊 Professional Structural Optimization Verification Report")
         report.append(f"**Date:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        target_config = self.config.get('target_config', {})
         report.append(f"**Domain:** {self.fem.Lx}mm x {self.fem.Ly}mm | **Material:** E={target_config.get('base_E', 210000)}MPa, v=0.3")
         report.append(f"**Resolution:** Target({Nx_h}x{Ny_h}) vs. Optimized({self.fem.nx}x{self.fem.ny})\n")
 
