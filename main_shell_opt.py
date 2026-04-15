@@ -150,12 +150,19 @@ def optimize_v2(self, opt_config, opt_target_config,
     # 모드 및 Z-좌표 매핑
     num_modes_loss = 5
     for global_target in getattr(self, 'global_opt_targets', []):
-        # Enum 속성 접근 방식 안전성 강화
-        if global_target.target_type == TargetType.MODES and getattr(global_target, 'num_modes', None):
-            num_modes_loss = global_target.num_modes
-            
-    t_vals = np.array(self.target_eigen['vals'])[:num_modes_loss]
+        if hasattr(global_target, 'target_type') and global_target.target_type == TargetType.MODES:
+            if hasattr(global_target, 'num_modes') and global_target.num_modes:
+                num_modes_loss = global_target.num_modes
+
+    # [CRITICAL FIX] num_modes_loss가 실제 로드된 데이터 개수보다 크면 IndexError 발생
+    # 데이터의 실제 열(Column) 개수를 기준으로 자동 클램핑합니다.
     t_modes_h_np = np.array(self.target_eigen['modes'])
+    num_modes_available = t_modes_h_np.shape[1]
+    num_modes_loss = min(num_modes_loss, num_modes_available)
+    
+    t_vals = np.array(self.target_eigen['vals'])[:num_modes_loss]
+
+
     
     # [STAGE 1: FUNDAMENTAL FIX] Parametric Modal Projection (Multi-Resolution Tech)
     # 3D jittered 보간은 지형 변화 시 매핑 위치가 어긋나는 본질적 불안정함이 있습니다.
