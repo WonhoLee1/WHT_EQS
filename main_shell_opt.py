@@ -227,7 +227,8 @@ def optimize_v2(self, opt_config, opt_target_config,
             self.scaling[k] = v_scalar if v_scalar > 1e-15 else 1.0
             
             init_phys = opt_config[k].get('init', 1.0 if k == 't' else 0.0)
-            if opt_config[k].get('type') == 'global':
+            # [PERFORMANCE] If not optimized, keep as scalar even if type is 'local' to reduce JAX graph complexity
+            if opt_config[k].get('type') == 'global' or not opt_config[k].get('opt', True):
                 val = jnp.mean(jnp.array(init_phys)) if isinstance(init_phys, (np.ndarray, jnp.ndarray)) else float(init_phys)
                 full_params_scaled[k] = jnp.array([val / self.scaling[k]])
             else:
@@ -674,8 +675,10 @@ def optimize_v2(self, opt_config, opt_target_config,
             print(f" [Iter {i:04d}/{max_iterations}] Optimizing...", end="", flush=True)
 
         # 모드 매칭 타겟이 존재할 때만 주기적으로 고유치 해석 수행
-        # [WHTOOLS] i=0 (첫 실행)에는 결과를 보여주기 위해 타겟 여부와 상관없이 강제 수행합니다.
+        # [WHTOOLS] [PERFORMANCE] 최적화 속도를 위해 고유치 해석 주기를 eigen_freq에 맞춥니다.
+        # i=0 (첫 실행)에는 결과를 보여주기 위해 타겟 여부와 상관없이 강제 수행합니다.
         compute_eigen_now = (i == 0) or ((i % eigen_freq == 0) and has_mode_target)
+
         
         if compute_eigen_now:
             (val, aux), grads = loss_vg_with_eigen(params, fixed_params_scaled)
@@ -695,9 +698,13 @@ def optimize_v2(self, opt_config, opt_target_config,
             last_best_mac = aux.get('best_mac')
         else:
             (val, aux), grads = loss_vg_no_eigen(params, fixed_params_scaled, cached_freqs, cached_vecs)
-            aux['f1_hz'] = cached_f1_hz # Restore for consistent output
-            aux['matched_freqs'] = last_matched_freqs if 'last_matched_freqs' in locals() else None
-            aux['best_mac'] = last_best_mac if 'last_best_mac' in locals() else None
+            # [CRITICAL FIX] do not overwrite with stale cached values from outer loop.
+            # Rayleigh quotient-based results in aux should be preserved for accurate reporting.
+            if 'matched_freqs' not in aux or aux['matched_freqs'] is None:
+                aux['matched_freqs'] = last_matched_freqs if 'last_matched_freqs' in locals() else None
+            if 'best_mac' not in aux or aux['best_mac'] is None:
+                aux['best_mac'] = last_best_mac if 'last_best_mac' in locals() else None
+
         
         if val < best_loss - early_stop_tol:
             best_loss, wait, best_params = val, 0, jax.tree_util.tree_map(jnp.array, params)
@@ -722,10 +729,10 @@ def optimize_v2(self, opt_config, opt_target_config,
 
         # [WHTOOLS] [NEW] Track Design Parameter Sensitivity (Change since last step)
         if i > 0:
-            dt_max = jnp.abs(params['t'] - prev_params['t']).max() * scaling_consts['t']
-            dpz_max = jnp.abs(params['pz'] - prev_params['pz']).max() * scaling_consts['pz']
-            dt_avg = jnp.abs(params['t'] - prev_params['t']).mean() * scaling_consts['t']
-            dpz_avg = jnp.abs(params['pz'] - prev_params['pz']).mean() * scaling_consts['pz']
+            dt_max = float(jnp.abs(params['t'] - prev_params['t']).max() * scaling_consts['t']) if 't' in params else 0.0
+            dpz_max = float(jnp.abs(params['pz'] - prev_params['pz']).max() * scaling_consts['pz']) if 'pz' in params else 0.0
+            dt_avg = float(jnp.abs(params['t'] - prev_params['t']).mean() * scaling_consts['t']) if 't' in params else 0.0
+            dpz_avg = float(jnp.abs(params['pz'] - prev_params['pz']).mean() * scaling_consts['pz']) if 'pz' in params else 0.0
             sens_info = f" | dt:{dt_max:.6f}(avg:{dt_avg:.7f}) | dz:{dpz_max:.4f}(avg:{dpz_avg:.5f})"
         else:
             sens_info = ""
@@ -733,10 +740,11 @@ def optimize_v2(self, opt_config, opt_target_config,
         
         # [WHTOOLS] [NEW] Track and Print Global Physical Values
         if i % 5 == 0:
-            t_phys = float(params.get('t', fixed_params_scaled.get('t'))[0]) * scaling_consts['t']
-            rho_phys = float(params.get('rho', fixed_params_scaled.get('rho'))[0]) * scaling_consts['rho']
-            E_phys = float(params.get('E', fixed_params_scaled.get('E'))[0]) * scaling_consts['E']
-            print(f" ╰─── 🧪 Globals: t={t_phys:.5f}mm | rho={rho_phys:.3e} | E={E_phys:.1f}MPa")
+            # [CRITICAL FIX] type: local 모드에서도 정상 작동하도록 float() 변환 전 jnp.mean() 취해 스칼라화
+            t_phys = float(jnp.mean(params.get('t', fixed_params_scaled.get('t')))) * scaling_consts['t']
+            rho_phys = float(jnp.mean(params.get('rho', fixed_params_scaled.get('rho')))) * scaling_consts['rho']
+            E_phys = float(jnp.mean(params.get('E', fixed_params_scaled.get('E')))) * scaling_consts['E']
+            print(f" ╰─── 🧪 Physical Stats (Mean): t={t_phys:.5f}mm | rho={rho_phys:.3e} | E={E_phys:.1f}MPa")
 
         iter_time = time.time() - iter_start
         if i != 0:
@@ -846,8 +854,8 @@ if __name__ == '__main__':
     model.add_case(CornerLiftCase("lift_br", corner='br', value=5.0, mode='disp', weight=1.0))
     model.add_case(CornerLiftCase("lift_tl", corner='tl', value=5.0, mode='disp', weight=1.0))
     model.add_case(TwoCornerLiftCase("lift_tl_br", corners=['br', 'tl'], value=5.0, mode='disp', weight=1.0))
-    model.add_case(CantileverCase("cantilever_x", axis='x', value=-5.0, mode='disp', weight=1.0))
-    model.add_case(CantileverCase("cantilever_y", axis='y', value=-5.0, mode='disp', weight=1.0))
+    #model.add_case(CantileverCase("cantilever_x", axis='x', value=-5.0, mode='disp', weight=1.0))
+    #model.add_case(CantileverCase("cantilever_y", axis='y', value=-5.0, mode='disp', weight=1.0))
     model.add_case(PressureCase("pressure_z", value=-10.0, weight=1.0))
     
     # 시나리오 테스트용 커스텀 OptTarget 설정
@@ -896,17 +904,17 @@ if __name__ == '__main__':
             "opt_targets": [
                 {"target_type": "rbe_reaction", "compare_mode": "relative", "weight": 1.0}
             ]
-        },
-        "cantilever_x": {
-            "opt_targets": [
-                {"target_type": "rbe_reaction", "compare_mode": "relative", "weight": 1.0}
-            ]
-        },
-        "cantilever_y": {
-            "opt_targets": [
-                {"target_type": "rbe_reaction", "compare_mode": "relative", "weight": 1.0}
-            ]
-        },
+        },        
+        #"cantilever_x": {
+        #    "opt_targets": [
+        #        {"target_type": "rbe_reaction", "compare_mode": "relative", "weight": 1.0}
+        #    ]
+        #},
+        #"cantilever_y": {
+        #    "opt_targets": [
+        #        {"target_type": "rbe_reaction", "compare_mode": "relative", "weight": 1.0}
+        #    ]
+        #},
         # [압력 하중] 전체 변형 분포 제어를 위해 RMS(제곱평균제곱근) 변위 사용
         "pressure_z": {
             "opt_targets": [
@@ -917,7 +925,7 @@ if __name__ == '__main__':
         # [BUG FIX 3] mass weight(5) >> modes weight(1) 이었으산 두께를 즌이면 주파수를 올리는 방향보다
         # 질량을 줄이는 방향이 5배 더 크게 보상 주어졌으므로 dt=0.8로 수렴 → 교정
         "global_targets": [
-            {"target_type": "mass", "compare_mode": "relative", "tolerance": 0.05, "weight": 1.0},
+        #    {"target_type": "mass", "compare_mode": "relative", "tolerance": 0.05, "weight": 1.0},
             {"target_type": "modes", "compare_mode": "mac", "num_modes": 3, "freq_weight": 0.5, "weight": 5.0}
         ]
     }
@@ -929,13 +937,13 @@ if __name__ == '__main__':
         'base_rho': 7.85e-9, 'base_E': 210000.0,
     }
     
-    model.generate_targets(resolution_high=(Nx_high, Ny_high), num_modes_save=5, target_config=target_config)
+    model.generate_targets(resolution_high=(Nx_high, Ny_high), num_modes_save=3, target_config=target_config)
         
     # 최적화 탐색 공간 설정
     opt_config = {
-        't':   {'opt': True, 'init': 1.0, 'min': 0.8, 'max': 1.2, 'type': 'global'},        
-        'rho': {'opt': True, 'init': 7.85e-9, 'min': 1e-10, 'max': 1e-7, 'type': 'global'},
-        'E':   {'opt': True, 'init': 210000.0, 'type': 'global'},        
+        't':   {'opt': True, 'init': 1.0, 'min': 0.8, 'max': 1.2, 'type': 'local'},        
+        'rho': {'opt': True, 'init': 7.85e-9, 'min': 1e-10, 'max': 1e-7, 'type': 'local'},
+        'E':   {'opt': False, 'init': 210000.0, 'type': 'local'},        
         'pz':  {'opt': True, 'init': 0.0, 'min': -20.0, 'max': 20.0, 'type': 'local'}, 
     }
     
@@ -952,7 +960,7 @@ if __name__ == '__main__':
                           learning_rate=0.5,           
                           min_bead_width=150.0,        
                           init_pz_from_gt=True,        
-                          gt_init_scale=0.5,
+                          gt_init_scale=0.0,
                           eigen_freq=10,
                           eigen_solver='lobpcg')               
                           
