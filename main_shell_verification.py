@@ -51,7 +51,7 @@ class EquivalentSheetModel:
     def add_case(self, case):
         self.cases.append(case)
 
-    def generate_targets(self, resolution_high=(120, 60), num_modes_save=5, cache_file="target_cache.pkl", target_config={}):
+    def generate_targets(self, resolution_high=(120, 60), num_modes_save=5, cache_file="target_cache.pkl", target_config={}, use_cache_override=None):
         """
         Generates ground truth data using a high-fidelity model.
         """
@@ -72,14 +72,15 @@ class EquivalentSheetModel:
         Xh, Yh = np.meshgrid(xh, yh, indexing='xy')
 
         # --- Cache Check ---
-        use_cache = False
-        if cache_file and os.environ.get("NON_INTERACTIVE"):
+        if use_cache_override is not None:
+            use_cache = use_cache_override
+        elif cache_file and os.environ.get("NON_INTERACTIVE") == "1":
             use_cache = os.path.exists(cache_file)
             print(f"[NON-INTERACTIVE] File exists: {use_cache}. Loading if possible.")
         elif cache_file and os.path.exists(cache_file):
             print(f"\n[CACHE DETECTED] Found existing Ground Truth data: {cache_file}")
             while True:
-                choice = input("Do you want to load from cache? [y/N]: ").strip().upper()
+                choice = input(" -> Do you want to load from cache? [y/N] (Default: N - Re-interpret): ").strip().upper()
                 if choice == 'Y':
                     use_cache = True
                     break
@@ -152,167 +153,172 @@ class EquivalentSheetModel:
         # [STAGE 1] Interactive Pattern Check - Always use latest mesh coords
         stage1_visualize_patterns(Nx_h, Ny_h, Xh, Yh, t_h, z_h_full)
             
-        # 3. Solve FEM for each load case (High Fidelity - Sparse Solve)
-        print("\nSolving High-Resolution Ground Truth (Sparse)...")
-        K_h, M_h = fem_high.assemble(self.target_params_high, sparse=True)
-        self.targets = []
-        
-        for case in self.cases:
-            print(f" -> Solving Case: {case.name}")
-            fixed_dofs, fixed_vals, F = case.get_bcs(fem_high)
-            free_dofs = np.setdiff1d(np.arange(fem_high.total_dof), fixed_dofs)
-            u = fem_high.solve_static_sparse(K_h, F, free_dofs, fixed_dofs, fixed_vals)
+        if not use_cache:
+            # 3. Solve FEM for each load case (High Fidelity - Sparse Solve)
+            print("\nSolving High-Resolution Ground Truth (Sparse)...")
+            K_h, M_h = fem_high.assemble(self.target_params_high, sparse=True)
+            self.targets = []
             
-            # Compute Detailed Field Results (Stress, Strain, SED)
-            f_res = fem_high.compute_field_results(u, self.target_params_high)
-            
-            # Compute Full Reaction Forces (Sparse Dot) for optimization matching
-            F_int = K_h @ jnp.array(u)
-            R_residual = F_int - np.array(F)
-            
-            # Create StructuralResult for ParaView export
-            res_fields = {
-                'displacement_vec': np.array(u),
-                'stress_vm': np.array(f_res['stress_vm']),
-                'strain_equiv': np.array(f_res['strain_equiv_nodal']),
-                'sed': np.array(f_res['sed'])
-            }
-            res = StructuralResult(res_fields, np.array(self.fem_high.nodes), fem_high.elements)
-            res.save_vtkhdf(f"gt_static_{case.name}.vtkhdf")
-            
-            target = {
-                'case_name': case.name,
-                'weight': case.weight,
-                'u_static': np.array(u[2::6]), 
-                'u_full': np.array(u),
-                'reaction_full': np.array(R_residual),
-                'max_stress': np.array(f_res['stress_vm']),
-                'max_strain': np.array(f_res['strain_equiv_nodal']),
-                'strain_energy_density': np.array(f_res['sed']),
-                'params': self.target_params_high,
-                'fixed_dofs': np.array(fixed_dofs),
-                'force_vector': np.array(F)
-            }
-            self.targets.append(target)
-            # Also create a structured ResultBundle for downstream OptTarget use
-            # Build node displacement dict (node_id -> [u,v,w])
-            node_disp_dict = {}
-            num_nodes = fem_high.nodes.shape[0]
-            u_full = np.array(u)
-            for n in range(num_nodes):
-                node_disp_dict[n] = u_full[n*6 : n*6+3]
-
-            rbemap = {'residual': np.array(R_residual)}
-            bundle = ResultBundle(
-                fields={
-                    'displacement_vec': np.array(u),
-                    'u_static': np.array(u[2::6]),
-                    'stress_vm': np.array(f_res['stress_vm']),
-                    'max_stress': np.array(f_res['stress_vm']),
-                    'strain_equiv': np.array(f_res['strain_equiv_nodal']),
-                    'max_strain': np.array(f_res['strain_equiv_nodal']),
-                    'sed': np.array(f_res['sed']),
-                    'strain_energy_density': np.array(f_res['sed'])
-                },
-                rbe_reactions=rbemap,
-                node_disps=node_disp_dict,
-                mass=float(self.target_mass),
-                modes=[],
-                meta={'params': self.target_params_high, 'units': {'stress_vm': 'MPa', 'disp': 'mm', 'rbe_reaction': 'N'}}
-            )
-            self.targets_bundles.append(bundle)
+            for i, case in enumerate(self.cases):
+                print(f" -> Solving Case: {case.name}")
+                fixed_dofs, fixed_vals, F = case.get_bcs(fem_high)
+                free_dofs = np.setdiff1d(np.arange(fem_high.total_dof), fixed_dofs)
+                u = fem_high.solve_static_sparse(K_h, F, free_dofs, fixed_dofs, fixed_vals)
                 
-        # --- NEW: Generate Summary Ground Truth Plot (Moved Outside Loop) ---
-        print("\nGenerating Ground Truth Summary Plot (3xN)...")
-        n_cases = len(self.cases)
-        plt.rcParams.update({'font.size': 8})
-        fig, axes = plt.subplots(3, n_cases, figsize=(4*n_cases, 10), squeeze=False)
-        fig.suptitle(f"Ground Truth Analysis Summary (Resolution: {Nx_h}x{Ny_h})\nRows: Disp, Stress, Strain | Colormap: jet", fontsize=10)
-        
-        xh, yh = np.linspace(0, self.fem.Lx, Nx_h+1), np.linspace(0, self.fem.Ly, Ny_h+1)
-        
-        for i, target in enumerate(self.targets):
-            # Row 0: Displacement (Nodal)
-            data_w = target['u_static'].reshape(Ny_h+1, Nx_h+1)
-            im0 = axes[0, i].contourf(xh, yh, data_w, 30, cmap='jet')
-            axes[0, i].set_title(f"Case: {target['case_name']}\nMax Disp: {np.max(np.abs(data_w)):.3f}mm", fontsize=8)
-            axes[0, i].set_aspect('equal')
-            plt.colorbar(im0, ax=axes[0, i], shrink=0.7)
+                # Compute Detailed Field Results (Stress, Strain, SED)
+                f_res = fem_high.compute_field_results(u, self.target_params_high)
+                
+                # Compute Full Reaction Forces (Sparse Dot) for optimization matching
+                F_int = K_h @ jnp.array(u)
+                R_residual = F_int - np.array(F)
+                
+                # Create StructuralResult for ParaView export
+                res_fields = {
+                    'displacement_vec': np.array(u),
+                    'stress_vm': np.array(f_res['stress_vm']),
+                    'strain_equiv': np.array(f_res['strain_equiv_nodal']),
+                    'sed': np.array(f_res['sed'])
+                }
+                res = StructuralResult(res_fields, np.array(self.fem_high.nodes), fem_high.elements)
+                res.save_vtkhdf(f"gt_static_{case.name}.vtkhdf")
+                
+                target = {
+                    'case_name': case.name,
+                    'weight': case.weight,
+                    'u_static': np.array(u[2::6]), 
+                    'u_full': np.array(u),
+                    'reaction_full': np.array(R_residual),
+                    'max_stress': np.array(f_res['stress_vm']),
+                    'max_strain': np.array(f_res['strain_equiv_nodal']),
+                    'strain_energy_density': np.array(f_res['sed']),
+                    'params': self.target_params_high,
+                    'fixed_dofs': np.array(fixed_dofs),
+                    'force_vector': np.array(F)
+                }
+                self.targets.append(target)
+                # Also create a structured ResultBundle for downstream OptTarget use
+                # Build node displacement dict (node_id -> [u,v,w])
+                node_disp_dict = {}
+                num_nodes = fem_high.nodes.shape[0]
+                u_full = np.array(u)
+                for n in range(num_nodes):
+                    node_disp_dict[n] = u_full[n*6 : n*6+3]
+    
+                rbemap = {'residual': np.array(R_residual)}
+                bundle = ResultBundle(
+                    fields={
+                        'displacement_vec': np.array(u),
+                        'u_static': np.array(u[2::6]),
+                        'stress_vm': np.array(f_res['stress_vm']),
+                        'max_stress': np.array(f_res['stress_vm']),
+                        'strain_equiv': np.array(f_res['strain_equiv_nodal']),
+                        'max_strain': np.array(f_res['strain_equiv_nodal']),
+                        'sed': np.array(f_res['sed']),
+                        'strain_energy_density': np.array(f_res['sed'])
+                    },
+                    rbe_reactions=rbemap,
+                    node_disps=node_disp_dict,
+                    mass=float(self.target_mass),
+                    modes=[],
+                    meta={'params': self.target_params_high, 'units': {'stress_vm': 'MPa', 'disp': 'mm', 'rbe_reaction': 'N'}}
+                )
+                self.targets_bundles.append(bundle)
+                    
+            # --- NEW: Generate Summary Ground Truth Plot (Moved Outside Loop) ---
+            print("\nGenerating Ground Truth Summary Plot (3xN)...")
+            n_cases = len(self.cases)
+            plt.rcParams.update({'font.size': 8})
+            fig, axes = plt.subplots(3, n_cases, figsize=(4*n_cases, 10), squeeze=False)
+            fig.suptitle(f"Ground Truth Analysis Summary (Resolution: {Nx_h}x{Ny_h})\nRows: Disp, Stress, Strain | Colormap: jet", fontsize=10)
             
-            # Row 1/2: Max Surface Stress/Strain
-            # These can be nodal (if averaged) or elemental (if raw).
-            # We already have nodal averages in 'max_stress' and 'max_strain' keys.
-            s_field = target['max_stress']
-            e_field = target['max_strain']
+            xh, yh = np.linspace(0, self.fem.Lx, Nx_h+1), np.linspace(0, self.fem.Ly, Ny_h+1)
             
-            # Ensure we can reshape (project back to grid if necessary)
-            size_expected = (Nx_h+1)*(Ny_h+1)
-            if s_field.size == size_expected and e_field.size == size_expected:
-                data_s = s_field.reshape(Ny_h+1, Nx_h+1)
-                data_e = e_field.reshape(Ny_h+1, Nx_h+1) * 1000 # to microstrain
-            else:
-                # Fallback: if size doesn't match nodal grid, just plot max as text or skip contour
-                print(f" [WARN] Field sizes (S:{s_field.size}, E:{e_field.size}) don't match grid {size_expected}. Skipping contour.")
-                data_s = np.zeros((Ny_h+1, Nx_h+1))
-                data_e = np.zeros((Ny_h+1, Nx_h+1))
-
-            im1 = axes[1, i].contourf(xh, yh, data_s, 30, cmap='jet')
-            axes[1, i].set_title(f"Max Stress: {np.max(data_s):.2f} MPa", fontsize=8)
-            axes[1, i].set_aspect('equal')
-            plt.colorbar(im1, ax=axes[1, i], shrink=0.7)
+            for i, target in enumerate(self.targets):
+                # Row 0: Displacement (Nodal)
+                data_w = target['u_static'].reshape(Ny_h+1, Nx_h+1)
+                im0 = axes[0, i].contourf(xh, yh, data_w, 30, cmap='jet')
+                axes[0, i].set_title(f"Case: {target['case_name']}\nMax Disp: {np.max(np.abs(data_w)):.3f}mm", fontsize=8)
+                axes[0, i].set_aspect('equal')
+                plt.colorbar(im0, ax=axes[0, i], shrink=0.7)
+                
+                # Row 1/2: Max Surface Stress/Strain
+                # These can be nodal (if averaged) or elemental (if raw).
+                # We already have nodal averages in 'max_stress' and 'max_strain' keys.
+                s_field = target['max_stress']
+                e_field = target['max_strain']
+                
+                # Ensure we can reshape (project back to grid if necessary)
+                size_expected = (Nx_h+1)*(Ny_h+1)
+                if s_field.size == size_expected and e_field.size == size_expected:
+                    data_s = s_field.reshape(Ny_h+1, Nx_h+1)
+                    data_e = e_field.reshape(Ny_h+1, Nx_h+1) * 1000 # to microstrain
+                else:
+                    # Fallback: if size doesn't match nodal grid, just plot max as text or skip contour
+                    print(f" [WARN] Field sizes (S:{s_field.size}, E:{e_field.size}) don't match grid {size_expected}. Skipping contour.")
+                    data_s = np.zeros((Ny_h+1, Nx_h+1))
+                    data_e = np.zeros((Ny_h+1, Nx_h+1))
+    
+                im1 = axes[1, i].contourf(xh, yh, data_s, 30, cmap='jet')
+                axes[1, i].set_title(f"Max Stress: {np.max(data_s):.2f} MPa", fontsize=8)
+                axes[1, i].set_aspect('equal')
+                plt.colorbar(im1, ax=axes[1, i], shrink=0.7)
+                
+                im2 = axes[2, i].contourf(xh, yh, data_e, 30, cmap='jet')
+                axes[2, i].set_title(f"Max Strain: {np.max(data_e):.3f} e-3", fontsize=8)
+                axes[2, i].set_aspect('equal')
+                plt.colorbar(im2, ax=axes[2, i], shrink=0.7)
+                
+            plt.tight_layout(rect=[0, 0, 1, 0.96])
+            plt.savefig("ground_truth_3d_loadcases.png", dpi=150)
+            plt.close()
+            print(" -> Saved: ground_truth_3d_loadcases.png")
             
-            im2 = axes[2, i].contourf(xh, yh, data_e, 30, cmap='jet')
-            axes[2, i].set_title(f"Max Strain: {np.max(data_e):.3f} e-3", fontsize=8)
-            axes[2, i].set_aspect('equal')
-            plt.colorbar(im2, ax=axes[2, i], shrink=0.7)
+            # [ISSUE-015] Use unified solve_eigen_sparse (dense-eigh backend) for verification
+            vals, vecs = fem_high.solve_eigen_sparse(K_h, M_h, num_modes=num_modes_save + 20)
             
-        plt.tight_layout(rect=[0, 0, 1, 0.96])
-        plt.savefig("ground_truth_3d_loadcases.png", dpi=150)
-        plt.close()
-        print(" -> Saved: ground_truth_3d_loadcases.png")
-        
-        # [ISSUE-015] Use unified solve_eigen_sparse (dense-eigh backend) for verification
-        vals, vecs = fem_high.solve_eigen_sparse(K_h, M_h, num_modes=num_modes_save + 20)
-        
-        # solve_eigen_sparse already returns frequencies in Hz
-        all_freqs_h = np.array(vals)
-        start_idx = 6
-        print(f" -> Unified Standard: Skipping 6 RBMs. Target Mode 1 is index {start_idx} ({all_freqs_h[start_idx]:.2f} Hz)")
-
-        self.target_start_idx = start_idx
-        freqs_save = vals[start_idx : start_idx + num_modes_save]
-        modes_save = vecs[:, start_idx : start_idx + num_modes_save] # Full 6-DOF
-        
-        self.target_eigen = {
-            'vals': np.array(freqs_save),
-            'modes': np.array(modes_save[2::6, :]) # W-component for internal loss
-        }
-        
-        # --- NEW: Export Modal Results to Temporal VTKHDF ---
-        print("\nExporting Ground Truth Modal Analysis to ParaView...")
-        modal_res = StructuralResult({}, np.array(self.fem_high.nodes), fem_high.elements)
-        steps_dict = {
-            'values': freqs_save,
-            'point_data': {
-                'mode_shape_vec': [modes_save[:, i] for i in range(num_modes_save)]
+            # solve_eigen_sparse already returns frequencies in Hz
+            all_freqs_h = np.array(vals)
+            start_idx = 6
+            print(f" -> Unified Standard: Skipping 6 RBMs. Target Mode 1 is index {start_idx} ({all_freqs_h[start_idx]:.2f} Hz)")
+    
+            self.target_start_idx = start_idx
+            freqs_save = vals[start_idx : start_idx + num_modes_save]
+            modes_save = vecs[:, start_idx : start_idx + num_modes_save] # Full 6-DOF
+            
+            self.target_eigen = {
+                'vals': np.array(freqs_save),
+                'modes': np.array(modes_save[2::6, :]) # W-component for internal loss
             }
-        }
-        modal_res.save_vtkhdf("gt_modal_results.vtkhdf", steps_dict=steps_dict)
         
-        # Save to cache
-        if cache_file:
-            print(f"Saving Ground Truth to cache ({cache_file})...")
-            cache_data = {
-                'target_params_high': self.target_params_high,
-                'target_mass': self.target_mass,
-                'targets': self.targets,
-                'target_eigen': self.target_eigen
+            # --- NEW: Export Modal Results to Temporal VTKHDF ---
+            print("\nExporting Ground Truth Modal Analysis to ParaView...")
+            modal_res = StructuralResult({}, np.array(self.fem_high.nodes), fem_high.elements)
+            steps_dict = {
+                'values': freqs_save,
+                'point_data': {
+                    'mode_shape_vec': [modes_save[:, i] for i in range(num_modes_save)]
+                }
             }
-            try:
-                with open(cache_file, 'wb') as f:
-                    pickle.dump(cache_data, f)
-            except Exception as e:
-                print(f"[WARNING] Failed to save cache: {e}")
+            modal_res.save_vtkhdf("gt_modal_results.vtkhdf", steps_dict=steps_dict)
+            
+            # Save to cache
+            if cache_file:
+                print(f"Saving Ground Truth to cache ({cache_file})...")
+                cache_data = {
+                    'target_params_high': self.target_params_high,
+                    'target_mass': self.target_mass,
+                    'targets': self.targets,
+                    'target_eigen': self.target_eigen
+                }
+                try:
+                    with open(cache_file, 'wb') as f:
+                        pickle.dump(cache_data, f)
+                except Exception as e:
+                    print(f"[WARNING] Failed to save cache: {e}")
+        else:
+            # If using cache, we already have everything needed for self.target_eigen
+            # but we should still make sure self.fem_high is consistent if needed for verify()
+            pass
 
         # target_eigen['vals'] are already in Hz
         target_freqs = np.array(self.target_eigen['vals'])
@@ -1744,7 +1750,7 @@ class EquivalentSheetModel:
             u_ref = tgt['u_full']
             
             # Compute Detailed Field Results for Optimized model
-            f_res_opt = self.fem_high.compute_field_results(u_opt, self.optimized_params)
+            f_res_opt = self.fem_high.compute_field_results(u_opt, opt_params_h)
             
             # Export Optimized Static Result to ParaView
             res_fields_opt = {
@@ -1977,13 +1983,13 @@ if __name__ == '__main__':
                                         use_early_stopping=True, 
                                         early_stop_patience=40, 
                                         early_stop_tol=1e-8,
-                                        learning_rate=0.5,           
+                                        learning_rate=1.0,           
                                         num_modes_loss=3,            
                                         min_bead_width=150.0,        # [표준화] 제조 한계 150mm 적용
                                         mac_search_window=3,         
                                         mode_match_type='mac',    
                                         init_pz_from_gt=True,        # [NEW 옵션] 타겟 Ground Truth 좌표를 기반으로 초기 형태 전사 (사용)
-                                        gt_init_scale=0.5,           # 상향 조정 (0.3 -> 0.5)
+                                        gt_init_scale=0.0,           # 상향 조정 (0.3 -> 0.5)
                                         auto_scale=False)
                                         
         # --- STAGE 2: MAC FINE-TUNING ---

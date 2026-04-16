@@ -308,10 +308,10 @@ else:
 
 class PlateFEM:
     """High-level API for generalized FEM structural analysis."""
-    def __init__(self, Lx=None, Ly=None, nx=None, ny=None, nodes=None, elements=None):
+    def __init__(self, Lx=None, Ly=None, nx=None, ny=None, nodes=None, elements=None, wall_width=50.0, wall_height=50.0):
         if nodes is None:
             # Default to tray mesh as per project standard
-            nodes, elements = generate_tray_mesh_quads(Lx, Ly, wall_width=50.0, wall_height=50.0, nx=nx, ny=ny, mode='vertical')
+            nodes, elements = generate_tray_mesh_quads(Lx, Ly, wall_width=wall_width, wall_height=wall_height, nx=nx, ny=ny, mode='vertical')
         
         self.fem = ShellFEM(nodes, elements)
         self.Lx, self.Ly = Lx, Ly

@@ -37,21 +37,29 @@ E, nu = 210000.0, 0.3
 Fc = 100.0  # Increased load for better visibility [N]
 
 # --- 2. Custom ShellFEM Benchmark ---
-def run_shellfem():
+def run_shellfem(elem_type='quad'):
     nx, ny = 11, 11
     x = np.linspace(0, L, nx)
     y = np.linspace(0, W, ny)
     xv, yv = np.meshgrid(x, y)
     nodes = np.stack([xv.flatten(), yv.flatten(), np.zeros_like(xv.flatten())], axis=1)
-    elements = []
-    for j in range(ny-1):
-        for i in range(nx-1):
-            n1, n2, n4, n3 = j*nx+i, j*nx+i+1, (j+1)*nx+i, (j+1)*nx+i+1
-            elements.append([n1, n2, n3, n4])
-    quads = jnp.array(elements)
     
-    fem = ShellFEM(nodes, quads=quads)
-    params = {'E': E, 't': t, 'rho': 7.85e-9, 'quad_type': 'mitc4'}
+    elements = []
+    if elem_type == 'quad':
+        for j in range(ny-1):
+            for i in range(nx-1):
+                n1, n2, n4, n3 = j*nx+i, j*nx+i+1, (j+1)*nx+i, (j+1)*nx+i+1
+                elements.append([n1, n2, n3, n4])
+        fem = ShellFEM(nodes, quads=jnp.array(elements))
+    else: # triangle
+        for j in range(ny-1):
+            for i in range(nx-1):
+                n1, n2, n4, n3 = j*nx+i, j*nx+i+1, (j+1)*nx+i, (j+1)*nx+i+1
+                elements.append([n1, n2, n3]) # Upper left
+                elements.append([n2, n4, n3]) # Lower right
+        fem = ShellFEM(nodes, trias=jnp.array(elements))
+        
+    params = {'E': E, 't': t, 'rho': 7.85e-9}
     
     n00, nL0, n0L = 0, nx-1, (ny-1)*nx
     fixed_dofs = jnp.array([n00*6+2, nL0*6+2, n0L*6+2])
@@ -64,6 +72,7 @@ def run_shellfem():
     
     u = fem.solve_static(params, forces, fixed_dofs, fixed_vals)
     return jnp.abs(u[center_node*6+2]), 0.0
+
 
 # --- 3. JAX-FEM Solid Benchmark (Custom Solver for Windows) ---
 import scipy.sparse
@@ -170,33 +179,45 @@ def run_jaxfem():
 # --- 4. Main Execution ---
 if __name__ == "__main__":
     print("="*60)
-    print("SOLVER COMPARISON: ShellFEM (MITC4) vs JAX-FEM (HEX8 Solid)")
+    print("SOLVER COMPARISON: ShellFEM (MITC3/MITC4) vs JAX-FEM (HEX8 Solid)")
     print(f"Geometry: {L}x{W}x{t} mm, E={E}, nu={nu}")
     print(f"Loading: {Fc} N at center top")
     print("="*60)
     
-    print("\n[1/2] Running ShellFEM (Custom)...")
+    print("\n[1/3] Running ShellFEM (MITC4 - Quads)...")
     try:
-        def_sf, _ = run_shellfem()
-        print(f"  > Deflection: {def_sf:.6f} mm")
+        def_sf_q, _ = run_shellfem('quad')
+        print(f"  > Deflection: {def_sf_q:.6f} mm")
     except Exception as e:
-        print(f"  ! ShellFEM failed: {e}")
-        def_sf = 0.0
+        print(f"  ! ShellFEM MITC4 failed: {e}")
+        def_sf_q = 0.0
+
+    print("\n[2/3] Running ShellFEM (MITC3 - Trias)...")
+    try:
+        def_sf_t, _ = run_shellfem('tria')
+        print(f"  > Deflection: {def_sf_t:.6f} mm")
+    except Exception as e:
+        print(f"  ! ShellFEM MITC3 failed: {e}")
+        def_sf_t = 0.0
     
-    print("\n[2/2] Running JAX-FEM (Solid 3D)...")
+    print("\n[3/3] Running JAX-FEM (Solid 3D HEX8)...")
     try:
         def_jf, time_jf = run_jaxfem()
         print(f"  > Deflection: {def_jf:.6f} mm")
         print(f"  > Solve Time: {time_jf:.4f} sec")
         
-        diff_pct = (def_sf - def_jf)/def_jf * 100 if def_jf != 0 else 0.0
         print("\n" + "="*60)
-        print(f"COMPARISON RESULTS:")
-        print(f"  - Shell Deflection: {def_sf:.6f} mm")
-        print(f"  - Solid Deflection: {def_jf:.6f} mm")
-        print(f"  - Difference: {diff_pct:.2f} %")
-        print(" (Note: Solid model with 11x11x4 HEX8 elements is much 'stiffer' than MITC4 Shell)")
+        print(f"COMPARISON SUMMARY:")
+        if def_jf != 0:
+            print(f"  - MITC4 vs Solid: {(def_sf_q - def_jf)/def_jf * 100:+.2f} %")
+            print(f"  - MITC3 vs Solid: {(def_sf_t - def_jf)/def_jf * 100:+.2f} %")
+        print(f"  - MITC4 (Quad) Deflection: {def_sf_q:.6f} mm")
+        print(f"  - MITC3 (Tria) Deflection: {def_sf_t:.6f} mm")
+        print(f"  - Solid HEX8 Deflection:  {def_jf:.6f} mm")
         print("="*60)
+    except Exception as e:
+        print(f"  ! JAX-FEM failed: {e}")
+
     except Exception as e:
         print(f"  ! JAX-FEM failed: {e}")
         import traceback

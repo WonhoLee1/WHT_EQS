@@ -1,18 +1,48 @@
 import unicodedata
 
 def get_display_width(s):
-    """문자열의 실제 콘솔 출력 너비를 시각적으로 계산합니다 (한글 2, 영문 1, 이모지 2)."""
+    """
+    문자열의 실제 콘솔 출력 너비를 시각적으로 계산합니다.
+    (Variation Selector 16 대응 및 전각/반각 정교화)
+    """
+    s_str = str(s)
     width = 0
-    for char in str(s):
-        # East Asian Width (W: Wide, F: Fullwidth)는 2칸을 차지함
+    i = 0
+    while i < len(s_str):
+        char = s_str[i]
+        cp = ord(char)
+        
+        # Variation Selector 16 (\uFE0F) 검색 - 앞에 오는 문자를 이모지화(전각) 함
+        has_v16 = False
+        if i + 1 < len(s_str) and ord(s_str[i+1]) == 0xFE0F:
+            has_v16 = True
+            
+        category = unicodedata.category(char)
+        # 조합 문자는 너비 계산에서 제외
+        if category in ('Mn', 'Me', 'Cf'):
+            i += 1
+            continue
+        if cp == 0xFE0F:
+            i += 1
+            continue
+            
         status = unicodedata.east_asian_width(char)
-        if status in ('W', 'F'):
+        # 전각 문자(W, F), SMP 영역(대부분의 이모지), 또는 V16이 붙은 경우 너비 2
+        if status in ('W', 'F') or cp > 0xFFFF or has_v16:
             width += 2
-        # 이모지 (Surrogate pairs) 및 특정 유니코드 범위 처리
-        elif ord(char) > 0xFFFF or ord(char) in [0x231A, 0x231B, 0x23E9, 0x23EA, 0x2600, 0x2705]:
-            width += 2
+        elif 0x2000 <= cp <= 0x2BFF:
+            # 기호 및 화살표 영역 관리
+            if 0x2190 <= cp <= 0x21FF or 0x2500 <= cp <= 0x257F: 
+                width += 1
+            else:
+                width += 2
+        elif status == 'A':
+            # Ambiguous 문자는 터미널/폰트에 따라 다르나, 
+            # 윈도우 터미널 표준에 더 가깝게 1로 처리 (V16이 없을 경우)
+            width += 1
         else:
             width += 1
+        i += 1
     return width
 
 # Contextual Emoji Database (ICE Engine)
@@ -86,12 +116,18 @@ class WHTable:
     def render(self):
         widths = self._get_widths()
         def pad(s, width, align='left'):
-            s = str(s)
-            curr_w = get_display_width(s)
-            padding = " " * (width - curr_w)
-            if align == 'right': return padding + s
-            if align == 'center': return " "*(len(padding)//2) + s + " "*(len(padding)-len(padding)//2)
-            return s + padding
+            s_str = str(s)
+            curr_w = get_display_width(s_str)
+            total_pad = max(0, width - curr_w)
+            
+            if align == 'right':
+                return " " * total_pad + s_str
+            elif align == 'center':
+                left_pad = total_pad // 2
+                right_pad = total_pad - left_pad
+                return " " * left_pad + s_str + " " * right_pad
+            else: # left
+                return s_str + " " * total_pad
 
         out = []
         if self.title:

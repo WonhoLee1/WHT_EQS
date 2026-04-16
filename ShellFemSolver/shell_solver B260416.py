@@ -7,10 +7,6 @@ from jax import vmap, jit, custom_vjp, lax
 import numpy as np
 from functools import partial
 
-### ShellFemSolverVerification\verification_runner.py 
-### Passed / 소스코드 수정 제한 / 안전보호
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 #  Reference: MITC3/MITC4 Theory (Bathe/Dvorkin)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -40,8 +36,6 @@ def _get_B_mitc3(nodes):
         # beta.t = beta_x*tx + beta_y*ty = thy*tx - thx*ty
         v = v.at[3*i+1].set(-vt*ty).at[3*i+2].set(vt*tx)
         v = v.at[3*j+1].set(-vt*ty).at[3*j+2].set(vt*tx)
-
-
         return v
     G = jnp.stack([get_G_edge(0), get_G_edge(1)])
     M = jnp.array([[ex[0], ey[0]], [ex[1], ey[1]]]); invM = jnp.linalg.inv(M)
@@ -65,8 +59,6 @@ def _get_B_mitc4(xi, eta, nodes):
         vt = 0.25*jnp.array([(1-eta_p),(1-eta_p),(1+eta_p),(1+eta_p)]) if is_xi else 0.25*jnp.array([(1-xi_p),(1+xi_p),(1+xi_p),(1-xi_p)])
         tx, ty = (jp[0,0], jp[0,1]) if is_xi else (jp[1,0], jp[1,1])
         B = B.at[3*idx+1].set(-ty*vt).at[3*idx+2].set(tx*vt)
-
-
         return B
     B_gxi = 0.5*(1-eta)*get_cov_edge(0,-1,True) + 0.5*(1+eta)*get_cov_edge(0,1,True)
     B_get = 0.5*(1-xi)*get_cov_edge(-1,0,False) + 0.5*(1+xi)*get_cov_edge(1,0,False)
@@ -103,57 +95,46 @@ def _get_B_bending_t3(nodes):
 
 def compute_mitc3_local(E, t, nu, rho, x2d, y2d):
     """
-    Optimized Tria Assembly: MITC3.
-    Constructs K_full using block-wise assembly for performance.
+    Tria Assembly: MITC3 (Membrane CST + Bending Mindlin + MITC3 Shear).
+    Nodal DOFs: [u, v, w, thx, thy, rz]
     """
     nodes2d = jnp.stack([x2d, y2d], 1)
     detJ = (x2d[1]-x2d[0])*(y2d[2]-y2d[0]) - (x2d[2]-x2d[0])*(y2d[1]-y2d[0])
     area = 0.5 * jnp.abs(detJ)
     
-    # 1. Material matrices
+    # 1. Membrane (CST)
     Dm = (E*t/(1-nu**2)) * jnp.array([[1, nu, 0], [nu, 1, 0], [0, 0, (1-nu)/2]])
-    Db = (E*t**3/(12*(1-nu**2))) * jnp.array([[1, nu, 0], [nu, 1, 0], [0, 0, (1-nu)/2]])
-    G_shear = E / (2 * (1 + nu)) 
-    Ds = (G_shear * t * 5/6) * jnp.eye(2)
-    
-    # 2. B-matrices
     Bm_c, _ = _get_B_tria_membrane(nodes2d)
-    Bb = _get_B_bending_t3(nodes2d)
-    Bs = _get_B_mitc3(nodes2d)
-    
-    # 3. Stiffness components
     Km = (Bm_c.T @ Dm @ Bm_c) * area
-    Kb = (Bb.T @ Db @ Bb) * area
-    Ks = (Bs.T @ Ds @ Bs) * area
-    K_bend_shear = Kb + Ks
     
-    # 4. Dense block-wise assembly (Avoid .at[].set() for speed)
-    def get_k_node(i, j):
-        # Extract 2x2 membrane block
-        km_block = Km[2*i:2*i+2, 2*j:2*j+2]
-        # Extract 3x3 bending/shear block
-        kb_block = K_bend_shear[3*i:3*i+3, 3*j:3*j+3]
-        # Drilling stabilization (diagonal only)
-        k_drill = jnp.where(i == j, 1e-7 * G_shear * t * area, 0.0)
-        
-        # Build 6x6 nodal block
-        # Rows 0,1: Membrane | Rows 2,3,4: Bending/Shear | Row 5: Drilling
-        row01 = jnp.concatenate([km_block, jnp.zeros((2, 4))], axis=1)
-        row234 = jnp.concatenate([jnp.zeros((3, 2)), kb_block, jnp.zeros((3, 1))], axis=1)
-        row5 = jnp.zeros((1, 6)).at[0, 5].set(k_drill)
-        return jnp.concatenate([row01, row234, row5], axis=0)
-
-
-    rows = []
-    for i in range(3):
-        rows.append(jnp.concatenate([get_k_node(i, j) for j in range(3)], axis=1))
-    K_full = jnp.concatenate(rows, axis=0)
+    # 2. Bending (Standard Mindlin Curvature: [w, thx, thy])
+    Db = (E*t**3/(12*(1-nu**2))) * jnp.array([[1, nu, 0], [nu, 1, 0], [0, 0, (1-nu)/2]])
+    Bb = _get_B_bending_t3(nodes2d)
+    Kb = (Bb.T @ Db @ Bb) * area
+    
+    # 3. Shear (MITC3 Mixed Edge-Interpolation)
+    G = E / (2 * (1 + nu)) 
+    Ds = (G * t * 5/6) * jnp.eye(2)
+    Bs = _get_B_mitc3(nodes2d)
+    Ks = (Bs.T @ Ds @ Bs) * area
+    
+    # Assembly to 18x18
+    # Local DOFs: [u1, v1, w1, thx1, thy1, rz1, ...]
+    K_full = jnp.zeros((18, 18))
+    m_p = jnp.array([0,1, 6,7, 12,13])
+    b_p = jnp.array([2,3,4, 8,9,10, 14,15,16])
+    
+    K_full = K_full.at[jnp.ix_(m_p, m_p)].set(Km)
+    # No Te_b needed if Bb/Bs are already in [w, thx, thy] space matching global [W, RX, RY]
+    K_full = K_full.at[jnp.ix_(b_p, b_p)].set(Kb + Ks)
+    
+    # Stabilization for Drilling
+    K_full = K_full.at[jnp.array([5, 11, 17]), jnp.array([5, 11, 17])].add(1e-7 * G * t * area)
     
     # Mass
     m_n = rho * area * t / 3.0; Ir = m_n * (t**2) / 12.0
     M_full = jnp.diag(jnp.tile(jnp.array([m_n, m_n, m_n, Ir, Ir, Ir*0.01]), 3))
     return K_full, M_full
-
 
 
 
@@ -188,10 +169,7 @@ def recover_curvature_quad_bending(u, nodes, quads, E, nu, t):
         j = jnp.array([[jnp.dot(dN_dxi,p2d[:,0]),jnp.dot(dN_dxi,p2d[:,1])],[jnp.dot(dN_det,p2d[:,0]),jnp.dot(dN_det,p2d[:,1])]])
         u_g = u.reshape(-1,6)[ix]; tx = u_g[:,3]*e1[0]+u_g[:,4]*e1[1]; ty = u_g[:,3]*e2[0]+u_g[:,4]*e2[1]
         invJ = jnp.linalg.inv(j); dN_dx = invJ[0,0]*dN_dxi+invJ[0,1]*dN_det; dN_dy = invJ[1,0]*dN_dxi+invJ[1,1]*dN_det
-        # NOTE: e3=-Z (inverted normal) due to mesh connectivity ordering causes local-frame
-        # curvatures to appear negated vs. Kirchhoff convention. The negation below compensates
-        # so stress_x_el correlates with analytical TOP surface (z=+t/2 global).
-        # For VM stress (optimization loss), this sign is irrelevant (VM is sign-invariant).
+        # Apply global negation to align with analytical convention and fixed T3 logic
         return -jnp.array([jnp.dot(dN_dx, ty), -jnp.dot(dN_dy, tx), jnp.dot(dN_dy, ty) - jnp.dot(dN_dx, tx)])
 
 
@@ -267,32 +245,32 @@ def compute_mitc4_local_fast(E, t, nu, rho, p2d):
         dN_dy = invJ[1,0]*dN_dxi + invJ[1,1]*dN_det
         Bm = _B_membrane_q4_fast(dN_dx, dN_dy)
         Bb = _B_bending_q4_fast(dN_dx, dN_dy)
-        return (Bm.T @ C_m @ Bm) * detJ, (Bb.T @ C_b @ Bb) * detJ, detJ
+        dKm = (Bm.T @ C_m @ Bm) * detJ
+        dKb = (Bb.T @ C_b @ Bb) * detJ
+        return dKm, dKb, detJ
 
     dKm_all, dKb_all, detJ_all = vmap(quadrature_point)(gps)
     K_m, K_b = dKm_all.sum(0), dKb_all.sum(0)
-    Bs, detJs = _get_B_mitc4(0.0, 0.0, p2d)
-    K_s = (Bs.T @ C_s @ Bs) * (detJs * 4.0)
+    
+    # Shear (MITC4 Mixed Interpolation)
+    def shear_mitc4(nodes):
+        # We integrate MITC4 shear at 4 points (center of edges) implicitly via _get_B_mitc4
+        # For simplicity and fast JAX execution, we evaluate shear at midpoints if possible, 
+        # but _get_B_mitc4 provides 2x12 matrix.
+        Bs, detJs = _get_B_mitc4(0.0, 0.0, nodes)
+        return (Bs.T @ C_s @ Bs) * (detJs * 4.0)
+    
+    K_s = shear_mitc4(p2d)
 
-    # Simplified block assembly for performance
-    def get_k_node_q(i, j):
-        km_ij = K_m[2*i:2*i+2, 2*j:2*j+2]
-        kb_ij = (K_b + K_s)[3*i:3*i+3, 3*j:3*j+3]
-        k_drill = jnp.where(i == j, 1e-7*G*t*jnp.mean(detJ_all), 0.0)
-        
-        row01 = jnp.concatenate([km_ij, jnp.zeros((2, 4))], axis=1)
-        row234 = jnp.concatenate([jnp.zeros((3, 2)), kb_ij, jnp.zeros((3, 1))], axis=1)
-        row5 = jnp.zeros((1, 6)).at[0, 5].set(k_drill)
-        return jnp.concatenate([row01, row234, row5], axis=0)
-
-    rows = []
-    for i in range(4):
-        rows.append(jnp.concatenate([get_k_node_q(i, j) for j in range(4)], axis=1))
-    K_l = jnp.concatenate(rows, axis=0)
+    K_l = jnp.zeros((24,24))
+    m_p = jnp.array([0,1,6,7,12,13,18,19])
+    b_p = jnp.array([2,3,4,8,9,10,14,15,16,20,21,22])
+    K_l = K_l.at[jnp.ix_(m_p,m_p)].set(K_m)
+    K_l = K_l.at[jnp.ix_(b_p,b_p)].set(K_b + K_s)
+    K_l = K_l.at[jnp.array([5,11,17,23]), jnp.array([5,11,17,23])].add(1e-7*G*t*jnp.mean(detJ_all))
     area = jnp.sum(detJ_all); m_n = rho*area*t/4.0; Ir=m_n*(t**2)/12.0
     M_local = jnp.diag(jnp.tile(jnp.array([m_n,m_n,m_n,Ir,Ir,Ir*0.01]), 4))
     return K_l, M_local
-
 
 
 
@@ -371,22 +349,16 @@ class ShellFEM:
                 Eq, tq, rq = jnp.mean(Eq_n), jnp.mean(tq_n), jnp.mean(rq_n)
                 K_l, M_l = compute_mitc4_local_fast(Eq, tq, nu, rq, p2d)
                 
-                # Optimized Te transformation using einsum style
-                # T_node = [[T, 0], [0, T]] (6x6)
-                # K_global = (I @ T_node) @ K_local @ (I @ T_node).T
-                # This is equivalent to transforming each 6x6 sub-block
-                K_reshaped = K_l.reshape(4, 6, 4, 6)
-                M_reshaped = M_l.reshape(4, 6, 4, 6)
-                
-                # Full 6x6 transformation matrix
+                # Robust block construction for the transformation matrix Te (24x24)
                 z3 = jnp.zeros((3,3))
                 Tn = jnp.block([[T3, z3], [z3, T3]])
                 
-                # K_g_iajb = Tn_ak * Tn_bl * K_l_ikjl
-                K_g = jnp.einsum('ak,bl,ikjl->iajb', Tn, Tn, K_reshaped).reshape(24, 24)
-                M_g = jnp.einsum('ak,bl,ikjl->iajb', Tn, Tn, M_reshaped).reshape(24, 24)
-                return K_g, M_g
-
+                # Construct Te by assigning Tn to each nodal block
+                Te = jnp.zeros((24, 24))
+                for i in range(4):
+                    Te = Te.at[6*i:6*i+6, 6*i:6*i+6].set(Tn)
+                
+                return Te @ K_l @ Te.T, Te @ M_l @ Te.T
             
             p2d_q = jnp.stack([jnp.zeros(len(self.quads)), jnp.zeros(len(self.quads)), Lx[:,0], jnp.zeros(len(self.quads)), Lx[:,0], 2.0*b_a, jnp.zeros(len(self.quads)), 2.0*b_a], 1).reshape(-1,4,2)
             Kq, Mq = vmap(oq)(E[self.quads], t[self.quads], rho[self.quads], p2d_q, Ts)
@@ -402,21 +374,12 @@ class ShellFEM:
             def ot(Et_n, tt_n, rt_n, x, y, T3):
                 Et, tt, rt = jnp.mean(Et_n), jnp.mean(tt_n), jnp.mean(rt_n)
                 K_l, M_l = compute_mitc3_local(Et, tt, nu, rt, x, y)
-                
-                K_reshaped = K_l.reshape(3, 6, 3, 6)
-                M_reshaped = M_l.reshape(3, 6, 3, 6)
-                
                 z3 = jnp.zeros((3,3)); Tn = jnp.block([[T3, z3], [z3, T3]])
-                
-                # K_g_iajb = Tn_ak * Tn_bl * K_l_ikjl
-                K_g = jnp.einsum('ak,bl,ikjl->iajb', Tn, Tn, K_reshaped).reshape(18, 18)
-                M_g = jnp.einsum('ak,bl,ikjl->iajb', Tn, Tn, M_reshaped).reshape(18, 18)
-                return K_g, M_g
-
+                Te = jsl.block_diag(Tn, Tn, Tn)
+                return Te @ K_l @ Te.T, Te @ M_l @ Te.T
                 
             Kt, Mt = vmap(ot)(E[self.trias], t[self.trias], rho[self.trias], x2d, y2d, Ts)
             vk.append(Kt.flatten()); vm.append(Mt.flatten())
-
 
         all_vk, all_vm = jnp.concatenate(vk), jnp.concatenate(vm)
         from jax.experimental.sparse import BCOO
@@ -459,27 +422,15 @@ class ShellFEM:
         sig_el = jnp.stack([pre*(eps_top[:,0]+nu*eps_top[:,1]), pre*(eps_top[:,1]+nu*eps_top[:,0]), spre*eps_top[:,2]], 1)
         vm_el = jnp.sqrt(jnp.maximum(sig_el[:,0]**2-sig_el[:,0]*sig_el[:,1]+sig_el[:,1]**2+3*sig_el[:,2]**2, 1e-12))
         vm_nodal, count = jnp.zeros(self.num_nodes), jnp.zeros(self.num_nodes)
-        sx_nodal, sy_nodal, sxy_nodal = jnp.zeros(self.num_nodes), jnp.zeros(self.num_nodes), jnp.zeros(self.num_nodes)
-        ex_nodal, ey_nodal, exy_nodal = jnp.zeros(self.num_nodes), jnp.zeros(self.num_nodes), jnp.zeros(self.num_nodes)
         if n_t>0:
             ix = self.trias.flatten()
-            vm_nodal = vm_nodal.at[ix].add(jnp.repeat(vm_el[:n_t], 3))
-            ex_nodal = ex_nodal.at[ix].add(jnp.repeat(eps_top[:n_t,0], 3))
-            ey_nodal = ey_nodal.at[ix].add(jnp.repeat(eps_top[:n_t,1], 3))
-            exy_nodal = exy_nodal.at[ix].add(jnp.repeat(eps_top[:n_t,2], 3))
-            count = count.at[ix].add(1)
+            vm_nodal = vm_nodal.at[ix].add(jnp.repeat(vm_el[:n_t], 3)); count = count.at[ix].add(1)
         if n_q>0:
             ix = self.quads.flatten()
-            vm_nodal = vm_nodal.at[ix].add(jnp.repeat(vm_el[n_t:], 4))
-            ex_nodal = ex_nodal.at[ix].add(jnp.repeat(eps_top[n_t:,0], 4))
-            ey_nodal = ey_nodal.at[ix].add(jnp.repeat(eps_top[n_t:,1], 4))
-            exy_nodal = exy_nodal.at[ix].add(jnp.repeat(eps_top[n_t:,2], 4))
-            count = count.at[ix].add(1)
+            vm_nodal = vm_nodal.at[ix].add(jnp.repeat(vm_el[n_t:], 4)); count = count.at[ix].add(1)
         return {'stress_vm': vm_nodal/jnp.maximum(count,1), 'stress_vm_el': vm_el,
                 'stress_x_el': sig_el[:,0], 'stress_y_el': sig_el[:,1], 'stress_xy_el': sig_el[:,2],
                 'strain_x_el': eps_top[:,0], 'strain_y_el': eps_top[:,1], 'strain_xy_el': eps_top[:,2],
-                'strain_x': ex_nodal/jnp.maximum(count,1), 'strain_y': ey_nodal/jnp.maximum(count,1),
-                'strain_xy': exy_nodal/jnp.maximum(count,1),
                 'strain_equiv_nodal': vm_nodal/(jnp.maximum(count,1)*E_n if jnp.ndim(E_n)>0 else E_n), 
                 'sed': vm_nodal/jnp.maximum(count,1) * 1e-4}
 
